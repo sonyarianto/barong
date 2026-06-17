@@ -128,6 +128,7 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                                 app.streaming_text.clear();
                                 app.chat_scroll = 0;
                                 app.should_auto_scroll = true;
+                                app.is_home = true;
                                 return Ok(());
                             }
                             "/help" => {
@@ -146,6 +147,7 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                     }
                     app.input.push_history(input.clone());
                     app.conversation.add_message("user".into(), input);
+                    app.is_home = false;
                     app.save_session();
                     app.should_auto_scroll = true;
                     app.chat_scroll = 0;

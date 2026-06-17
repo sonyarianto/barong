@@ -31,7 +31,17 @@ pub struct App {
     pub streaming_text: String,
     pub provider: ProviderKind,
     pub cancelled: Arc<AtomicBool>,
+    pub is_home: bool,
 }
+
+pub const SPLASH: &str = r#"
+██╗  ██╗ █████╗ ██╗     ██╗ ██████╗ ██████╗ ██████╗ ███████╗
+██║ ██╔╝██╔══██╗██║     ██║██╔════╝██╔═══██╗██╔══██╗██╔════╝
+█████╔╝ ███████║██║     ██║██║     ██║   ██║██║  ██║█████╗  
+██╔═██╗ ██╔══██║██║     ██║██║     ██║   ██║██║  ██║██╔══╝  
+██║  ██╗██║  ██║███████╗██║╚██████╗╚██████╔╝██████╔╝███████╗
+╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚═╝ ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝
+"#;
 
 impl App {
     pub fn new() -> Self {
@@ -42,15 +52,8 @@ impl App {
         let mut tool_registry = ToolRegistry::new();
         let session_manager = SessionManager::new();
 
-        let mut conversation = Conversation::new();
-        let session_id = if let Some(session) = session_manager.most_recent_session() {
-            for msg in &session.messages {
-                conversation.add_message(msg.role.clone(), msg.content.clone());
-            }
-            Some(session.id)
-        } else {
-            None
-        };
+        let conversation = Conversation::new();
+        let session_id = session_manager.most_recent_session().map(|s| s.id);
 
         let mcp_servers = Self::init_mcp(&config, &mut tool_registry);
         tool_registry.register_delegate(
@@ -79,6 +82,7 @@ impl App {
             streaming_text: String::new(),
             provider,
             cancelled: Arc::new(AtomicBool::new(false)),
+            is_home: true,
         }
     }
 

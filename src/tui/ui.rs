@@ -1,5 +1,5 @@
 use crate::app::App;
-use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
@@ -12,7 +12,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         .constraints([
             Constraint::Min(1),
             Constraint::Length(3),
-            Constraint::Length(1),
+            Constraint::Length(3),
         ])
         .split(area);
 
@@ -22,6 +22,33 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 }
 
 fn render_chat(frame: &mut Frame, area: Rect, app: &mut App) {
+    if app.is_home {
+        let block_style = Style::default()
+            .fg(Color::Rgb(57, 181, 74))
+            .add_modifier(Modifier::BOLD);
+        let mut splash_lines: Vec<Line> = crate::app::SPLASH
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| Line::from(Span::styled(l, block_style)))
+            .collect();
+        splash_lines.push(Line::from(Span::raw("")));
+        splash_lines.push(Line::from(Span::styled(
+            "  Type a message below to start a new session.",
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        let paragraph = Paragraph::new(splash_lines)
+            .alignment(Alignment::Center)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" KaliCode ")
+                    .border_style(Style::default().fg(Color::Rgb(57, 181, 74))),
+            );
+        frame.render_widget(paragraph, area);
+        return;
+    }
+
     let md = crate::tui::markdown::MarkdownRenderer::new();
     let mut all_lines: Vec<Line> = Vec::new();
 
