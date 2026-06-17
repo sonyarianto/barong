@@ -12,4 +12,12 @@ impl StatusBar {
             token_count: "tokens: 0".into(),
         }
     }
+
+    pub fn new_with_provider(provider: &str) -> Self {
+        Self {
+            llm_provider: format!("LLM: {}", provider),
+            tool_status: "idle".into(),
+            token_count: String::new(),
+        }
+    }
 }

@@ -117,12 +117,12 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                 let input = std::mem::take(&mut app.input.buffer);
                 app.input.cursor_pos = 0;
                 app.input.history_index = None;
-                if !input.is_empty() {
+                if !input.is_empty() && app.event_rx.is_none() {
                     app.input.push_history(input.clone());
                     app.conversation.add_message("user".into(), input);
-                    app.status.tool_status = "processing...".into();
                     app.should_auto_scroll = true;
                     app.chat_scroll = 0;
+                    app.start_agent();
                 }
             }
             KeyCode::Tab => {

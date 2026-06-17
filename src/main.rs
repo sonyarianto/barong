@@ -5,6 +5,7 @@ pub mod workspace;
 
 use anyhow::Result;
 use ratatui::DefaultTerminal;
+use std::time::Duration;
 
 mod app;
 
@@ -24,7 +25,10 @@ fn run(mut terminal: DefaultTerminal) -> Result<()> {
     let mut app = app::App::new();
     while !app.should_quit {
         terminal.draw(|frame| app.render(frame))?;
-        app.handle_events()?;
+        app.handle_stream()?;
+        if crossterm::event::poll(Duration::from_millis(50))? {
+            app.handle_events()?;
+        }
     }
     Ok(())
 }

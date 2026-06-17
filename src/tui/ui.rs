@@ -1,6 +1,6 @@
 use crate::app::App;
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
@@ -31,8 +31,20 @@ fn render_chat(frame: &mut Frame, area: Rect, app: &mut App) {
         all_lines.push(Line::from(Span::raw("")));
     }
 
+    if !app.streaming_text.is_empty() {
+        let stream_lines = md.render(&app.streaming_text, "assistant");
+        all_lines.extend(stream_lines);
+        all_lines.push(Line::from(Span::styled(
+            "█",
+            Style::default().fg(Color::Green).add_modifier(Modifier::SLOW_BLINK),
+        )));
+    }
+
     let total_lines = all_lines.len();
-    let inner = area.inner(Margin { vertical: 1, horizontal: 1 });
+    let inner = area.inner(Margin {
+        vertical: 1,
+        horizontal: 1,
+    });
     let visible_height = inner.height.max(1) as usize;
 
     if app.should_auto_scroll {
@@ -50,18 +62,20 @@ fn render_chat(frame: &mut Frame, area: Rect, app: &mut App) {
         .collect();
 
     let scroll_indicator = if total_lines > visible_height {
-        format!(" [{}/{}]", scroll + visible_height.min(total_lines), total_lines)
+        format!(
+            " [{}/{}]",
+            scroll + visible_height.min(total_lines),
+            total_lines
+        )
     } else {
         String::new()
     };
 
     let title_spans = vec![
         Span::styled(" Chat ", Style::default().fg(Color::White)),
-        Span::styled(
-            scroll_indicator,
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(scroll_indicator, Style::default().fg(Color::DarkGray)),
     ];
+
     let title_block = Block::default()
         .borders(Borders::ALL)
         .title(Line::from(title_spans))
@@ -73,26 +87,31 @@ fn render_chat(frame: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn render_input(frame: &mut Frame, area: Rect, app: &App) {
+    let focused = app.event_rx.is_none();
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Input ")
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(if focused {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        });
 
-    let cursor_char = if app.input.focused {
-        '█'
+    if focused {
+        let mut display = app.input.buffer.clone();
+        if app.input.cursor_pos <= display.len() {
+            display.insert(app.input.cursor_pos, '█');
+        }
+        let paragraph = Paragraph::new(display.as_str())
+            .block(block)
+            .style(Style::default().fg(Color::White));
+        frame.render_widget(paragraph, area);
     } else {
-        ' '
-    };
-
-    let mut display = app.input.buffer.clone();
-    if app.input.cursor_pos <= display.len() {
-        display.insert(app.input.cursor_pos, cursor_char);
+        let paragraph = Paragraph::new(" (waiting for response...)")
+            .block(block)
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(paragraph, area);
     }
-
-    let paragraph = Paragraph::new(display.as_str())
-        .block(block)
-        .style(Style::default().fg(Color::White));
-    frame.render_widget(paragraph, area);
 }
 
 fn render_status(frame: &mut Frame, area: Rect, app: &App) {
@@ -106,8 +125,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
             format!(" {} ", app.status.tool_status),
             Style::default().fg(match app.status.tool_status.as_str() {
                 "idle" => Color::Green,
-                "processing..." => Color::Yellow,
-                _ => Color::White,
+                _ => Color::Yellow,
             }),
         ),
         Span::raw("│"),
