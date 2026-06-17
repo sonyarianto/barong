@@ -16,6 +16,8 @@ pub struct App {
     pub status: StatusBar,
     pub should_quit: bool,
     pub tool_registry: Arc<ToolRegistry>,
+    pub chat_scroll: usize,
+    pub should_auto_scroll: bool,
 }
 
 impl App {
@@ -29,6 +31,8 @@ impl App {
             status: StatusBar::new(),
             should_quit: false,
             tool_registry,
+            chat_scroll: 0,
+            should_auto_scroll: true,
         }
     }
 
