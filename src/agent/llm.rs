@@ -17,6 +17,10 @@ pub enum StreamEvent {
         name: String,
         args: serde_json::Value,
     },
+    Usage {
+        input_tokens: u64,
+        output_tokens: u64,
+    },
     Done,
 }
 
@@ -33,6 +37,13 @@ impl ProviderKind {
             .to_lowercase()
             .as_str()
         {
+            "anthropic" => ProviderKind::Anthropic,
+            _ => ProviderKind::OpenAI,
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
             "anthropic" => ProviderKind::Anthropic,
             _ => ProviderKind::OpenAI,
         }
@@ -74,6 +85,10 @@ impl OpenAIProvider {
                 .unwrap_or_else(|_| "https://api.openai.com/v1".into()),
         }
     }
+
+    pub fn new(api_key: String, model: String, base_url: String) -> Self {
+        Self { api_key, model, base_url }
+    }
 }
 
 #[async_trait::async_trait]
@@ -108,6 +123,7 @@ impl LLMProvider for OpenAIProvider {
             "model": self.model,
             "messages": messages,
             "stream": true,
+            "stream_options": { "include_usage": true },
             "tools": tools_json,
         });
 
@@ -170,6 +186,13 @@ impl OpenAIProvider {
                 }
                 if let Some(data) = line.strip_prefix("data: ") {
                     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
+                        if let Some(usage) = parsed.get("usage") {
+                            let input_tokens = usage["prompt_tokens"].as_u64().unwrap_or(0);
+                            let output_tokens = usage["completion_tokens"].as_u64().unwrap_or(0);
+                            let _ = tx
+                                .send(StreamEvent::Usage { input_tokens, output_tokens })
+                                .await;
+                        }
                         if let Some(delta) = parsed["choices"][0]["delta"].as_object() {
                             if let Some(content) = delta.get("content") {
                                 let _ = tx
@@ -222,6 +245,7 @@ impl OpenAIProvider {
 pub struct AnthropicProvider {
     api_key: String,
     model: String,
+    max_tokens: u32,
 }
 
 impl AnthropicProvider {
@@ -232,7 +256,12 @@ impl AnthropicProvider {
                 .unwrap_or_default(),
             model: std::env::var("ANTHROPIC_MODEL")
                 .unwrap_or_else(|_| "claude-sonnet-4-20250514".into()),
+            max_tokens: 4096,
         }
+    }
+
+    pub fn new(api_key: String, model: String, max_tokens: u32) -> Self {
+        Self { api_key, model, max_tokens }
     }
 }
 
@@ -247,6 +276,7 @@ impl LLMProvider for AnthropicProvider {
 
         let api_key = self.api_key.clone();
         let model = self.model.clone();
+        let max_tokens = self.max_tokens;
         let messages_clone = messages.to_vec();
 
         let tools_json: Vec<serde_json::Value> = tools
@@ -276,7 +306,7 @@ impl LLMProvider for AnthropicProvider {
             let mut body = serde_json::json!({
                 "model": model,
                 "messages": messages_clone,
-                "max_tokens": 4096,
+                "max_tokens": max_tokens,
                 "stream": true,
             });
 
@@ -318,6 +348,8 @@ impl LLMProvider for AnthropicProvider {
             let mut current_tool_input = String::new();
             let mut current_tool_id = String::new();
             let mut in_tool_block = false;
+            let mut input_tokens = 0u64;
+            let mut output_tokens = 0u64;
 
             while let Some(chunk) = stream.next().await {
                 let bytes = match chunk {
@@ -353,6 +385,15 @@ impl LLMProvider for AnthropicProvider {
                         }
 
                         match event_type.as_str() {
+                            "message_start" => {
+                                if let Ok(parsed) =
+                                    serde_json::from_str::<serde_json::Value>(&data)
+                                {
+                                    if let Some(msg) = parsed.get("message") {
+                                        input_tokens = msg["usage"]["input_tokens"].as_u64().unwrap_or(0);
+                                    }
+                                }
+                            }
                             "content_block_start" => {
                                 if let Ok(parsed) =
                                     serde_json::from_str::<serde_json::Value>(&data)
@@ -408,6 +449,7 @@ impl LLMProvider for AnthropicProvider {
                                 if let Ok(parsed) =
                                     serde_json::from_str::<serde_json::Value>(&data)
                                 {
+                                    output_tokens = parsed["usage"]["output_tokens"].as_u64().unwrap_or(0);
                                     if let Some(stop_reason) =
                                         parsed["delta"]["stop_reason"].as_str()
                                     {
@@ -435,6 +477,9 @@ impl LLMProvider for AnthropicProvider {
                 }
             }
 
+            let _ = tx
+                .send(StreamEvent::Usage { input_tokens, output_tokens })
+                .await;
             let _ = tx.send(StreamEvent::Done).await;
         });
 

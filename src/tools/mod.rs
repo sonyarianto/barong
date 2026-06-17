@@ -3,6 +3,8 @@ pub mod write_file;
 pub mod edit_file;
 pub mod search;
 pub mod run_command;
+pub mod glob;
+pub mod delegate;
 
 use crate::agent::llm::ToolDef;
 use anyhow::Result;
@@ -28,6 +30,7 @@ fn global_tools() -> &'static HashMap<String, Box<dyn Tool>> {
         m.insert("edit_file".into(), Box::new(edit_file::EditFile));
         m.insert("search".into(), Box::new(search::Search));
         m.insert("run_command".into(), Box::new(run_command::RunCommand));
+        m.insert("glob".into(), Box::new(glob::Glob));
         m
     })
 }
@@ -50,7 +53,18 @@ impl ToolRegistry {
         registry.register(Box::new(edit_file::EditFile));
         registry.register(Box::new(search::Search));
         registry.register(Box::new(run_command::RunCommand));
+        registry.register(Box::new(glob::Glob));
         registry
+    }
+
+    pub fn register_delegate(
+        &mut self,
+        api_key: String,
+        model: String,
+        base_url: String,
+        provider: crate::agent::llm::ProviderKind,
+    ) {
+        self.register(Box::new(delegate::Delegate::new(api_key, model, base_url, provider)));
     }
 
     pub fn register(&mut self, tool: Box<dyn Tool>) {

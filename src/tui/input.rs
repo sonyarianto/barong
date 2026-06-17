@@ -1,6 +1,7 @@
 use crate::app::App;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use std::sync::atomic::Ordering;
 
 pub struct InputState {
     pub buffer: String,
@@ -118,8 +119,34 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                 app.input.cursor_pos = 0;
                 app.input.history_index = None;
                 if !input.is_empty() && app.event_rx.is_none() {
+                    if input.starts_with('/') {
+                        match input.trim() {
+                            "/quit" | "/exit" => { app.should_quit = true; return Ok(()); }
+                            "/clear" | "/new" => {
+                                app.conversation = crate::agent::conversation::Conversation::new();
+                                app.session_id = None;
+                                app.streaming_text.clear();
+                                app.chat_scroll = 0;
+                                app.should_auto_scroll = true;
+                                return Ok(());
+                            }
+                            "/help" => {
+                                app.conversation.add_message("assistant".into(),
+                                    "**Commands:**\n- `/quit` or `/exit` — quit\n- `/clear` or `/new` — new session\n- `/help` — this message".into());
+                                app.save_session();
+                                return Ok(());
+                            }
+                            _ => {
+                                app.conversation.add_message("assistant".into(),
+                                    format!("Unknown command: `{}`. Try `/help`.", input));
+                                app.save_session();
+                                return Ok(());
+                            }
+                        }
+                    }
                     app.input.push_history(input.clone());
                     app.conversation.add_message("user".into(), input);
+                    app.save_session();
                     app.should_auto_scroll = true;
                     app.chat_scroll = 0;
                     app.start_agent();
@@ -130,7 +157,13 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                 app.input.cursor_pos += 2;
             }
             KeyCode::Esc => {
-                app.should_quit = true;
+                if app.event_rx.is_some() {
+                    app.cancelled.store(true, Ordering::Relaxed);
+                    app.event_rx = None;
+                    app.save_session();
+                    app.streaming_text.clear();
+                    app.status.tool_status = "cancelled".into();
+                }
             }
             KeyCode::PageUp => {
                 app.chat_scroll = app.chat_scroll.saturating_add(5);

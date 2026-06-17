@@ -1,3 +1,4 @@
+use crate::tui::syntax;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -21,11 +22,14 @@ impl MarkdownRenderer {
 
         let mut in_code_block = false;
         let mut code_block_lang = String::new();
+        let mut code_block_lines: Vec<String> = Vec::new();
 
         for raw_line in text.lines() {
             if raw_line.trim_start().starts_with("```") {
                 if in_code_block {
                     in_code_block = false;
+                    self.emit_code_block(&mut lines, &prefix, &code_block_lang, &code_block_lines);
+                    code_block_lines.clear();
                     code_block_lang.clear();
                     let line = Line::from(vec![
                         prefix.clone(),
@@ -52,14 +56,7 @@ impl MarkdownRenderer {
             }
 
             if in_code_block {
-                let line = Line::from(vec![
-                    prefix.clone(),
-                    Span::styled(
-                        raw_line,
-                        Style::default().fg(Color::LightYellow).bg(Color::DarkGray),
-                    ),
-                ]);
-                lines.push(line);
+                code_block_lines.push(raw_line.to_string());
                 continue;
             }
 
@@ -69,7 +66,27 @@ impl MarkdownRenderer {
             lines.push(Line::from(spans));
         }
 
+        if in_code_block && !code_block_lines.is_empty() {
+            self.emit_code_block(&mut lines, &prefix, &code_block_lang, &code_block_lines);
+        }
+
         lines
+    }
+
+    fn emit_code_block<'a>(&self, lines: &mut Vec<Line<'a>>, prefix: &Span<'a>, lang: &str, code_lines: &[String]) {
+        let lang_opt = if lang.is_empty() { None } else { Some(lang) };
+        let highlighted = syntax::highlight_code_block(
+            code_lines.iter().map(|s| s.as_str()).collect(),
+            lang_opt,
+        );
+
+        for (spans, _is_bold) in highlighted {
+            let mut line_spans = vec![prefix.clone()];
+            for (style, text) in spans {
+                line_spans.push(Span::styled(text, style));
+            }
+            lines.push(Line::from(line_spans));
+        }
     }
 
     fn parse_inline<'a>(&self, text: &'a str) -> Vec<Span<'a>> {
@@ -106,10 +123,14 @@ impl MarkdownRenderer {
                 let rest = &text[i + 2..];
                 if let Some(end) = rest.find("**") {
                     let bold_text = &rest[..end];
-                    spans.push(Span::styled(
-                        bold_text,
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ));
+                    let style = if bold_text.starts_with("Tool:") {
+                        Style::default().fg(Color::LightYellow).add_modifier(Modifier::BOLD)
+                    } else if bold_text.ends_with("result:") || bold_text.ends_with("result") {
+                        Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().add_modifier(Modifier::BOLD)
+                    };
+                    spans.push(Span::styled(bold_text, style));
                     for _ in 0..=(end + 3) {
                         chars.next();
                     }

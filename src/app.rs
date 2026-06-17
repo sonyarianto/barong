@@ -1,12 +1,16 @@
 use crate::agent::r#loop::start_agent_loop;
 use crate::agent::conversation::Conversation;
 use crate::agent::llm::{LLMProvider, OpenAIProvider, AnthropicProvider, StreamEvent, ProviderKind};
+use crate::config::Config;
+use crate::mcp::{McpServer, McpToolAdapter};
+use crate::session::SessionManager;
 use crate::tui::input::InputState;
 use crate::tui::status::StatusBar;
 use crate::tools::ToolRegistry;
 use crate::workspace::WorkspaceContext;
 use anyhow::Result;
 use ratatui::Frame;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -17,31 +21,64 @@ pub struct App {
     pub status: StatusBar,
     pub should_quit: bool,
     pub tool_registry: Arc<ToolRegistry>,
+    pub config: Config,
+    pub session_manager: SessionManager,
+    pub session_id: Option<String>,
+    pub mcp_servers: Vec<std::sync::Arc<std::sync::Mutex<McpServer>>>,
     pub chat_scroll: usize,
     pub should_auto_scroll: bool,
     pub event_rx: Option<mpsc::Receiver<StreamEvent>>,
     pub streaming_text: String,
     pub provider: ProviderKind,
+    pub cancelled: Arc<AtomicBool>,
 }
 
 impl App {
     pub fn new() -> Self {
-        let provider = ProviderKind::from_env();
+        let config = Config::load();
+        let provider_str = config.resolve_provider();
+        let provider = ProviderKind::from_str(&provider_str);
         let status_str = format!("LLM: {}", provider);
-        let tool_registry = Arc::new(ToolRegistry::new());
+        let mut tool_registry = ToolRegistry::new();
+        let session_manager = SessionManager::new();
+
+        let mut conversation = Conversation::new();
+        let session_id = if let Some(session) = session_manager.most_recent_session() {
+            for msg in &session.messages {
+                conversation.add_message(msg.role.clone(), msg.content.clone());
+            }
+            Some(session.id)
+        } else {
+            None
+        };
+
+        let mcp_servers = Self::init_mcp(&config, &mut tool_registry);
+        tool_registry.register_delegate(
+            config.resolve_api_key(&provider_str),
+            config.resolve_model(&provider_str),
+            config.resolve_base_url(),
+            provider,
+        );
+
+        let tool_registry = Arc::new(tool_registry);
 
         Self {
-            conversation: Conversation::new(),
+            conversation,
             input: InputState::new(),
             workspace: WorkspaceContext::new(),
             status: StatusBar::new_with_provider(&status_str),
             should_quit: false,
             tool_registry,
+            config,
+            session_manager,
+            session_id,
+            mcp_servers,
             chat_scroll: 0,
             should_auto_scroll: true,
             event_rx: None,
             streaming_text: String::new(),
             provider,
+            cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -61,6 +98,10 @@ impl App {
                         self.streaming_text.push_str(&token);
                         self.should_auto_scroll = true;
                     }
+                    Ok(StreamEvent::Usage { input_tokens, output_tokens }) => {
+                        self.status.token_count =
+                            format!("in:{} out:{}", input_tokens, output_tokens);
+                    }
                     Ok(StreamEvent::ToolCall { id: _, name, args }) => {
                         let content = format!("Tool call: {} ({})", name, args);
                         self.conversation.add_message("tool".into(), content);
@@ -71,6 +112,7 @@ impl App {
                             let text = std::mem::take(&mut self.streaming_text);
                             self.conversation.add_message("assistant".into(), text);
                         }
+                        self.save_session();
                         self.event_rx = None;
                         self.status.tool_status = "idle".into();
                         self.should_auto_scroll = true;
@@ -82,6 +124,7 @@ impl App {
                             let text = std::mem::take(&mut self.streaming_text);
                             self.conversation.add_message("assistant".into(), text);
                         }
+                        self.save_session();
                         self.event_rx = None;
                         self.status.tool_status = "idle".into();
                         break;
@@ -92,18 +135,77 @@ impl App {
         Ok(())
     }
 
+    pub fn save_session(&mut self) {
+        match self.session_id.as_ref() {
+            Some(id) => self.session_manager.update(id, &self.conversation.messages),
+            None => {
+                let id = self.session_manager.save(&self.conversation.messages);
+                self.session_id = Some(id);
+            }
+        }
+    }
+
+    fn init_mcp(config: &Config, tool_registry: &mut ToolRegistry) -> Vec<std::sync::Arc<std::sync::Mutex<McpServer>>> {
+        let mut servers = Vec::new();
+        for sc in &config.mcp_servers {
+            match McpServer::spawn(&sc.name, &sc.command, &sc.args) {
+                Ok(server) => {
+                    let server = std::sync::Arc::new(std::sync::Mutex::new(server));
+                    if let Ok(mut locked) = server.lock() {
+                        if let Ok(tools) = locked.list_tools() {
+                            for t in tools {
+                                let adapter = McpToolAdapter {
+                                    server_name: sc.name.clone(),
+                                    tool_name: t.name,
+                                    description: t.description,
+                                    schema: t.input_schema,
+                                    server: server.clone(),
+                                };
+                                tool_registry.register(Box::new(adapter));
+                            }
+                        }
+                    }
+                    servers.push(server);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to start MCP server '{}': {}", sc.name, e);
+                }
+            }
+        }
+        servers
+    }
+
     pub fn start_agent(&mut self) {
+        let context_block = self.workspace.summary();
+        let system_prompt = format!(
+            "{}\n\n## Workspace Context\n{}",
+            include_str!("../prompts/system.md"),
+            context_block,
+        );
+        self.conversation.set_system_prompt(system_prompt);
+
         let provider: Box<dyn LLMProvider> = match self.provider {
-            ProviderKind::OpenAI => Box::new(OpenAIProvider::from_env()),
-            ProviderKind::Anthropic => Box::new(AnthropicProvider::from_env()),
+            ProviderKind::OpenAI => Box::new(OpenAIProvider::new(
+                self.config.resolve_api_key("openai"),
+                self.config.resolve_model("openai"),
+                self.config.resolve_base_url(),
+            )),
+            ProviderKind::Anthropic => Box::new(AnthropicProvider::new(
+                self.config.resolve_api_key("anthropic"),
+                self.config.resolve_model("anthropic"),
+                self.config.resolve_max_tokens(),
+            )),
         };
 
         let context = self.conversation.full_context();
         let tools = self.tool_registry.definitions();
         let (tx, rx) = mpsc::channel(64);
+        self.cancelled.store(false, Ordering::Relaxed);
+        let cancel_flag = self.cancelled.clone();
+        let tool_registry = self.tool_registry.clone();
 
         tokio::spawn(async move {
-            start_agent_loop(provider, context, tools, tx).await;
+            start_agent_loop(provider, context, tools, tool_registry, tx, cancel_flag).await;
         });
 
         self.event_rx = Some(rx);

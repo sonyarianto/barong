@@ -2,6 +2,9 @@ pub mod tui;
 pub mod agent;
 pub mod tools;
 pub mod workspace;
+pub mod config;
+pub mod session;
+pub mod mcp;
 
 use anyhow::Result;
 use ratatui::DefaultTerminal;
@@ -14,6 +17,9 @@ fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_target(false)
         .init();
+
+    let rt = tokio::runtime::Runtime::new()?;
+    let _guard = rt.enter();
 
     let terminal = ratatui::init();
     let result = run(terminal);

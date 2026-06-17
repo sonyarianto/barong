@@ -133,6 +133,11 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
             format!(" msgs:{} ", app.conversation.messages.len()),
             Style::default().fg(Color::DarkGray),
         ),
+        Span::raw("│"),
+        Span::styled(
+            format!(" {} ", app.status.token_count),
+            Style::default().fg(Color::DarkGray),
+        ),
     ];
 
     let block = Block::default()

@@ -1,19 +1,23 @@
 use crate::agent::conversation::Message;
 use crate::agent::llm::{LLMProvider, StreamEvent, ToolDef};
-use crate::tools;
+use crate::tools::ToolRegistry;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 pub async fn start_agent_loop(
     provider: Box<dyn LLMProvider>,
     messages: Vec<Message>,
     tools: Vec<ToolDef>,
+    tool_registry: Arc<ToolRegistry>,
     tx: mpsc::Sender<StreamEvent>,
+    cancelled: Arc<AtomicBool>,
 ) {
     let mut iteration = 0u32;
     let max_iterations = 25u32;
     let mut all_messages = messages;
 
-    while iteration < max_iterations {
+    while iteration < max_iterations && !cancelled.load(Ordering::Relaxed) {
         iteration += 1;
 
         let mut stream = match provider.stream_chat(&all_messages, &tools).await {
@@ -38,8 +42,20 @@ pub async fn start_agent_loop(
                 StreamEvent::ToolCall { id, name, args } => {
                     tool_calls.push((id, name, args));
                 }
+                StreamEvent::Usage { input_tokens, output_tokens } => {
+                    let _ = tx
+                        .send(StreamEvent::Usage { input_tokens, output_tokens })
+                        .await;
+                }
                 StreamEvent::Done => break,
             }
+        }
+
+        if cancelled.load(Ordering::Relaxed) {
+            let _ = tx
+                .send(StreamEvent::Text("\n\n*Cancelled by user*".into()))
+                .await;
+            break;
         }
 
         if !response_text.is_empty() {
@@ -63,12 +79,16 @@ pub async fn start_agent_loop(
         });
 
         for (_id, name, args) in &tool_calls {
+            if cancelled.load(Ordering::Relaxed) {
+                break;
+            }
+
             all_messages.push(Message {
                 role: "assistant".into(),
                 content: format!("I need to use the {} tool.", name),
             });
 
-            if let Some(tool) = tools::get_tool(name) {
+            if let Some(tool) = tool_registry.get(name) {
                 let result = tool.call(args.clone()).await;
                 let content = match result {
                     Ok(output) => serde_json::to_string_pretty(&output).unwrap_or_default(),
