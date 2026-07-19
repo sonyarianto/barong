@@ -30,6 +30,7 @@ pub struct App {
     pub event_rx: Option<mpsc::Receiver<StreamEvent>>,
     pub streaming_text: String,
     pub provider: ProviderKind,
+    pub current_model: String,
     pub cancelled: Arc<AtomicBool>,
     pub is_home: bool,
 }
@@ -48,7 +49,7 @@ impl App {
         let config = Config::load();
         let provider_str = config.resolve_provider();
         let provider = ProviderKind::from_str(&provider_str);
-        let status_str = format!("LLM: {}", provider);
+        let current_model = config.resolve_model(&provider_str);
         let mut tool_registry = ToolRegistry::new();
         let session_manager = SessionManager::new();
 
@@ -69,7 +70,7 @@ impl App {
             conversation,
             input: InputState::new(),
             workspace: WorkspaceContext::new(),
-            status: StatusBar::new_with_provider(&status_str),
+            status: StatusBar::new_with_provider(&provider.to_string(), &current_model),
             should_quit: false,
             tool_registry,
             config,
@@ -81,6 +82,7 @@ impl App {
             event_rx: None,
             streaming_text: String::new(),
             provider,
+            current_model: current_model.clone(),
             cancelled: Arc::new(AtomicBool::new(false)),
             is_home: true,
         }
@@ -191,12 +193,12 @@ impl App {
         let provider: Box<dyn LLMProvider> = match self.provider {
             ProviderKind::OpenAI => Box::new(OpenAIProvider::new(
                 self.config.resolve_api_key("openai"),
-                self.config.resolve_model("openai"),
+                self.current_model.clone(),
                 self.config.resolve_base_url(),
             )),
             ProviderKind::Anthropic => Box::new(AnthropicProvider::new(
                 self.config.resolve_api_key("anthropic"),
-                self.config.resolve_model("anthropic"),
+                self.current_model.clone(),
                 self.config.resolve_max_tokens(),
             )),
         };

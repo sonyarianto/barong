@@ -1,4 +1,4 @@
-use crate::agent::conversation::Message;
+use crate::agent::conversation::{Message, ToolCallFunction, ToolCallMessage};
 use crate::agent::llm::{LLMProvider, StreamEvent, ToolDef};
 use crate::tools::ToolRegistry;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,7 +30,7 @@ pub async fn start_agent_loop(
             }
         };
 
-        let mut tool_calls = Vec::new();
+        let mut tool_calls: Vec<(String, String, serde_json::Value)> = Vec::new();
         let mut response_text = String::new();
 
         while let Some(event) = stream.recv().await {
@@ -58,10 +58,30 @@ pub async fn start_agent_loop(
             break;
         }
 
-        if !response_text.is_empty() {
+        if !response_text.is_empty() || !tool_calls.is_empty() {
+            let tool_call_messages = if tool_calls.is_empty() {
+                None
+            } else {
+                Some(
+                    tool_calls
+                        .iter()
+                        .map(|(id, name, args)| ToolCallMessage {
+                            id: id.clone(),
+                            type_: "function".into(),
+                            function: ToolCallFunction {
+                                name: name.clone(),
+                                arguments: args.to_string(),
+                            },
+                        })
+                        .collect(),
+                )
+            };
+
             all_messages.push(Message {
                 role: "assistant".into(),
-                content: response_text,
+                content: if response_text.is_empty() { None } else { Some(response_text) },
+                tool_calls: tool_call_messages,
+                tool_call_id: None,
             });
         }
 
@@ -73,36 +93,32 @@ pub async fn start_agent_loop(
         let tx_clone = tx.clone();
         tokio::spawn(async move {
             for (_id, name, args) in calls_for_spawn {
-                let content = format!("**Tool: {}**\n```json\n{}\n```", name, args);
+                let content = format!("▸ **{}** `{}`", name, args);
                 let _ = tx_clone.send(StreamEvent::Text(content)).await;
             }
         });
 
-        for (_id, name, args) in &tool_calls {
+        for (id, name, args) in &tool_calls {
             if cancelled.load(Ordering::Relaxed) {
                 break;
             }
 
-            all_messages.push(Message {
-                role: "assistant".into(),
-                content: format!("I need to use the {} tool.", name),
-            });
-
             if let Some(tool) = tool_registry.get(name) {
-                let result = tool.call(args.clone()).await;
+                let result = tool.call(args.clone(), Some(tx.clone())).await;
                 let content = match result {
                     Ok(output) => serde_json::to_string_pretty(&output).unwrap_or_default(),
                     Err(e) => format!("Error: {}", e),
                 };
                 all_messages.push(Message {
                     role: "tool".into(),
-                    content: content.clone(),
+                    content: Some(content.clone()),
+                    tool_calls: None,
+                    tool_call_id: Some(id.clone()),
                 });
 
-                let truncated = &content[..content.len().min(500)];
                 let result_event = StreamEvent::Text(format!(
-                    "\n\n**{} result:**\n```\n{}\n```",
-                    name, truncated
+                    "\n{}",
+                    summarize_result(name, &content, 3)
                 ));
                 let _ = tx.send(result_event).await;
             }
@@ -110,4 +126,71 @@ pub async fn start_agent_loop(
     }
 
     let _ = tx.send(StreamEvent::Done).await;
+}
+
+fn summarize_result(tool: &str, content: &str, max_lines: usize) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let total_lines = lines.len();
+
+    let summary = if let Ok(val) = serde_json::from_str::<serde_json::Value>(content) {
+        summarize_json(&val)
+    } else {
+        format!("{} chars", content.len())
+    };
+
+    if total_lines <= max_lines + 1 {
+        return format!(
+            "◂ **{}** — {}\n```\n{}```",
+            tool, summary, content
+        );
+    }
+
+    let head: Vec<&str> = lines.iter().take(max_lines).copied().collect();
+    let rest = total_lines - max_lines;
+    format!(
+        "◂ **{}** — {} ({} lines)\n```\n{}\n```\n_... {} more lines_",
+        tool,
+        summary,
+        total_lines,
+        head.join("\n"),
+        rest
+    )
+}
+
+fn summarize_json(val: &serde_json::Value) -> String {
+    match val {
+        serde_json::Value::Object(map) => {
+            if map.len() == 1 {
+                for (k, v) in map {
+                    if let serde_json::Value::Array(arr) = v {
+                        return format!("{} items in `{}`", arr.len(), k);
+                    }
+                    if let serde_json::Value::String(s) = v {
+                        if s.len() < 80 {
+                            return format!("`{}` = \"{}\"", k, s);
+                        }
+                        return format!("`{}` ({} chars)", k, s.len());
+                    }
+                }
+            }
+            let parts: Vec<String> = map
+                .iter()
+                .map(|(k, v)| match v {
+                    serde_json::Value::Array(a) => format!("{}:{} items", k, a.len()),
+                    serde_json::Value::String(s) => format!("{}:{}c", k, s.len()),
+                    _ => format!("{}:{}", k, v),
+                })
+                .collect();
+            parts.join(", ")
+        }
+        serde_json::Value::Array(arr) => format!("{} items", arr.len()),
+        serde_json::Value::String(s) => {
+            if s.len() <= 80 {
+                format!("\"{}\"", s)
+            } else {
+                format!("{} chars", s.len())
+            }
+        }
+        _ => format!("{}", val),
+    }
 }

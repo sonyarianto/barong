@@ -23,9 +23,12 @@ impl MarkdownRenderer {
         let mut in_code_block = false;
         let mut code_block_lang = String::new();
         let mut code_block_lines: Vec<String> = Vec::new();
+        let mut in_table = false;
+        let mut table_lines: Vec<String> = Vec::new();
 
         for raw_line in text.lines() {
             if raw_line.trim_start().starts_with("```") {
+                self.flush_table(&mut lines, &prefix, &mut in_table, &mut table_lines);
                 if in_code_block {
                     in_code_block = false;
                     self.emit_code_block(&mut lines, &prefix, &code_block_lang, &code_block_lines);
@@ -60,6 +63,17 @@ impl MarkdownRenderer {
                 continue;
             }
 
+            let trimmed = raw_line.trim();
+            if trimmed.starts_with('|') && trimmed.ends_with('|') {
+                in_table = true;
+                table_lines.push(raw_line.to_string());
+                continue;
+            }
+
+            if in_table {
+                self.flush_table(&mut lines, &prefix, &mut in_table, &mut table_lines);
+            }
+
             let styled_spans = self.parse_inline(raw_line);
             let mut spans = vec![prefix.clone()];
             spans.extend(styled_spans);
@@ -69,6 +83,7 @@ impl MarkdownRenderer {
         if in_code_block && !code_block_lines.is_empty() {
             self.emit_code_block(&mut lines, &prefix, &code_block_lang, &code_block_lines);
         }
+        self.flush_table(&mut lines, &prefix, &mut in_table, &mut table_lines);
 
         lines
     }
@@ -87,6 +102,79 @@ impl MarkdownRenderer {
             }
             lines.push(Line::from(line_spans));
         }
+    }
+
+    fn flush_table<'a>(&self, lines: &mut Vec<Line<'a>>, prefix: &Span<'a>, in_table: &mut bool, table_lines: &mut Vec<String>) {
+        if !*in_table {
+            return;
+        }
+        *in_table = false;
+        let rows = std::mem::take(table_lines);
+
+        // Determine column widths
+        let mut col_widths: Vec<usize> = Vec::new();
+        for row in &rows {
+            let cells: Vec<&str> = row
+                .split('|')
+                .filter(|c| !c.is_empty())
+                .collect();
+            for (i, cell) in cells.iter().enumerate() {
+                let clean = cell.trim();
+                if i >= col_widths.len() {
+                    col_widths.push(clean.len());
+                } else {
+                    col_widths[i] = col_widths[i].max(clean.len());
+                }
+            }
+        }
+
+        let table_style = Style::default().fg(Color::LightCyan);
+        let sep_style = Style::default().fg(Color::DarkGray);
+        let header_style = Style::default()
+            .fg(Color::LightCyan)
+            .add_modifier(Modifier::BOLD);
+
+        for (row_idx, row) in rows.iter().enumerate() {
+            let cells: Vec<&str> = row
+                .split('|')
+                .filter(|c| !c.is_empty())
+                .collect();
+
+            let mut spans = vec![prefix.clone()];
+
+            // Detect separator row (|---|)
+            if row.trim().chars().all(|c| c == '|' || c == '-' || c == ':') {
+                spans.push(Span::styled("├─", sep_style));
+                for (i, w) in col_widths.iter().enumerate() {
+                    let sep = "─".repeat(*w);
+                    spans.push(Span::styled(sep, sep_style));
+                    if i < col_widths.len() - 1 {
+                        spans.push(Span::styled("─┼─", sep_style));
+                    }
+                }
+                spans.push(Span::styled("─┤", sep_style));
+                lines.push(Line::from(spans));
+                continue;
+            }
+
+            let style = if row_idx == 0 { header_style } else { table_style };
+            spans.push(Span::styled("│ ", style));
+            for (i, cell) in cells.iter().enumerate() {
+                let clean = cell.trim();
+                let w = col_widths.get(i).copied().unwrap_or(clean.len());
+                let padded = format!("{:<width$}", clean, width = w);
+                spans.push(Span::styled(padded, style));
+                if i < col_widths.len() - 1 {
+                    spans.push(Span::styled(" │ ", style));
+                }
+            }
+            spans.push(Span::styled(" │", style));
+            lines.push(Line::from(spans));
+        }
+        lines.push(Line::from(vec![
+            prefix.clone(),
+            Span::raw(""),
+        ]));
     }
 
     fn parse_inline<'a>(&self, text: &'a str) -> Vec<Span<'a>> {

@@ -6,18 +6,20 @@ pub mod run_command;
 pub mod glob;
 pub mod delegate;
 
+pub use crate::agent::llm::StreamEvent;
 use crate::agent::llm::ToolDef;
 use anyhow::Result;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::OnceLock;
+use tokio::sync::mpsc;
 
 #[async_trait::async_trait]
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn schema(&self) -> Value;
-    async fn call(&self, args: Value) -> Result<Value>;
+    async fn call(&self, args: Value, tx: Option<mpsc::Sender<StreamEvent>>) -> Result<Value>;
 }
 
 static GLOBAL_TOOLS: OnceLock<HashMap<String, Box<dyn Tool>>> = OnceLock::new();

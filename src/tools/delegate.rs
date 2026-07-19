@@ -3,6 +3,7 @@ use crate::agent::llm::{AnthropicProvider, LLMProvider, OpenAIProvider, Provider
 use crate::tools::Tool;
 use anyhow::Result;
 use serde_json::Value;
+use tokio::sync::mpsc;
 
 pub struct Delegate {
     api_key: String,
@@ -40,7 +41,7 @@ impl Tool for Delegate {
         })
     }
 
-    async fn call(&self, args: Value) -> Result<Value> {
+    async fn call(&self, args: Value, tx: Option<mpsc::Sender<StreamEvent>>) -> Result<Value> {
         let task = args["task"].as_str().unwrap_or("");
 
         let llm_provider: Box<dyn LLMProvider> = match self.provider {
@@ -59,11 +60,15 @@ impl Tool for Delegate {
         let messages = vec![
             Message {
                 role: "system".into(),
-                content: "You are a focused sub-agent. Complete the assigned task concisely. Do not ask questions — just do it and report the result.".into(),
+                content: Some("You are a focused sub-agent. Complete the assigned task concisely. Do not ask questions — just do it and report the result.".into()),
+                tool_calls: None,
+                tool_call_id: None,
             },
             Message {
                 role: "user".into(),
-                content: task.to_string(),
+                content: Some(task.to_string()),
+                tool_calls: None,
+                tool_call_id: None,
             },
         ];
 
@@ -72,7 +77,12 @@ impl Tool for Delegate {
 
         while let Some(event) = stream.recv().await {
             match event {
-                StreamEvent::Text(t) => response.push_str(&t),
+                StreamEvent::Text(token) => {
+                    response.push_str(&token);
+                    if let Some(ref t) = tx {
+                        let _ = t.send(StreamEvent::Text(token)).await;
+                    }
+                }
                 StreamEvent::Done => break,
                 _ => {}
             }

@@ -1,5 +1,5 @@
 use crate::app::App;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
@@ -53,54 +53,81 @@ fn render_chat(frame: &mut Frame, area: Rect, app: &mut App) {
     let mut all_lines: Vec<Line> = Vec::new();
 
     for msg in &app.conversation.messages {
-        let role_lines = md.render(&msg.content, &msg.role);
-        all_lines.extend(role_lines);
+        let role_color = match msg.role.as_str() {
+            "user" => Color::Blue,
+            "tool" => Color::Yellow,
+            _ => Color::Rgb(57, 181, 74),
+        };
+        let role_lines = md.render(msg.content.as_deref().unwrap_or(""), &msg.role);
+        for mut line in role_lines {
+            line.spans.insert(0, Span::styled("│ ", Style::default().fg(role_color)));
+            all_lines.push(line);
+        }
         all_lines.push(Line::from(Span::raw("")));
     }
 
     if !app.streaming_text.is_empty() {
         let stream_lines = md.render(&app.streaming_text, "assistant");
-        all_lines.extend(stream_lines);
+        for mut line in stream_lines {
+            line.spans.insert(0, Span::styled("│ ", Style::default().fg(Color::Rgb(57, 181, 74))));
+            all_lines.push(line);
+        }
         all_lines.push(Line::from(Span::styled(
-            "█",
+            "│ █",
             Style::default().fg(Color::Green).add_modifier(Modifier::SLOW_BLINK),
         )));
     }
 
     let total_lines = all_lines.len();
-    let inner = area.inner(Margin {
+    let inner = area.inner(ratatui::layout::Margin {
         vertical: 1,
         horizontal: 1,
     });
-    let visible_height = inner.height.max(1) as usize;
+    let visible_rows = inner.height.max(1);
+
+    // Estimate how many logical lines fit in visible_rows after wrapping
+    let fit_count = all_lines
+        .iter()
+        .scan(0u16, |acc, line| {
+            let line_str: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            let content_width = inner.width.saturating_sub(1).max(1);
+            let wrapped = ((line_str.len() as u16) + content_width - 1) / content_width;
+            *acc += wrapped.max(1);
+            if *acc > visible_rows { None } else { Some(()) }
+        })
+        .count();
 
     if app.should_auto_scroll {
-        app.chat_scroll = total_lines.saturating_sub(visible_height);
+        app.chat_scroll = total_lines.saturating_sub(fit_count);
     }
 
-    let scroll = app.chat_scroll.min(total_lines.saturating_sub(1));
-    let scroll = scroll.max(0);
+    let scroll = app.chat_scroll.min(total_lines.saturating_sub(1)).max(0);
+
+    // Take enough lines to cover visible_rows after wrapping
+    let mut take_count = 0usize;
+    let mut row_accum = 0u16;
+    for line in all_lines.iter().skip(scroll) {
+        if row_accum >= visible_rows { break; }
+        let line_str: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        let content_width = inner.width.saturating_sub(1).max(1);
+        let wrapped = ((line_str.len() as u16) + content_width - 1) / content_width;
+        row_accum += wrapped.max(1);
+        take_count += 1;
+    }
 
     let visible_lines: Vec<Line> = all_lines
         .iter()
         .skip(scroll)
-        .take(visible_height)
+        .take(take_count + 1)
         .cloned()
         .collect();
 
-    let scroll_indicator = if total_lines > visible_height {
-        format!(
-            " [{}/{}]",
-            scroll + visible_height.min(total_lines),
-            total_lines
-        )
-    } else {
-        String::new()
-    };
-
     let title_spans = vec![
         Span::styled(" Chat ", Style::default().fg(Color::White)),
-        Span::styled(scroll_indicator, Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!(" [{}/{}]", scroll, total_lines),
+            Style::default().fg(Color::DarkGray),
+        ),
     ];
 
     let title_block = Block::default()
@@ -146,6 +173,11 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled(
             format!(" {} ", app.status.llm_provider),
             Style::default().fg(Color::Cyan),
+        ),
+        Span::raw("│"),
+        Span::styled(
+            format!(" {} ", app.status.model),
+            Style::default().fg(Color::Magenta),
         ),
         Span::raw("│"),
         Span::styled(

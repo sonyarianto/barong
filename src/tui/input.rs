@@ -120,29 +120,41 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                 app.input.history_index = None;
                 if !input.is_empty() && app.event_rx.is_none() {
                     if input.starts_with('/') {
-                        match input.trim() {
-                            "/quit" | "/exit" => { app.should_quit = true; return Ok(()); }
-                            "/clear" | "/new" => {
-                                app.conversation = crate::agent::conversation::Conversation::new();
-                                app.session_id = None;
-                                app.streaming_text.clear();
-                                app.chat_scroll = 0;
-                                app.should_auto_scroll = true;
-                                app.is_home = true;
-                                return Ok(());
-                            }
-                            "/help" => {
+                        let trimmed = input.trim();
+                        if trimmed == "/quit" || trimmed == "/exit" {
+                            app.should_quit = true; return Ok(());
+                        } else if trimmed == "/clear" || trimmed == "/new" {
+                            app.conversation = crate::agent::conversation::Conversation::new();
+                            app.session_id = None;
+                            app.streaming_text.clear();
+                            app.chat_scroll = 0;
+                            app.should_auto_scroll = true;
+                            app.is_home = true;
+                            return Ok(());
+                        } else if trimmed.starts_with("/model") {
+                            let parts: Vec<&str> = trimmed.splitn(2, char::is_whitespace).collect();
+                            if parts.len() < 2 || parts[1].is_empty() {
                                 app.conversation.add_message("assistant".into(),
-                                    "**Commands:**\n- `/quit` or `/exit` — quit\n- `/clear` or `/new` — new session\n- `/help` — this message".into());
-                                app.save_session();
-                                return Ok(());
-                            }
-                            _ => {
+                                    format!("**Current model:** `{}`", app.current_model));
+                            } else {
+                                let new_model = parts[1].trim().to_string();
+                                app.current_model = new_model;
+                                app.status.model = app.current_model.clone();
                                 app.conversation.add_message("assistant".into(),
-                                    format!("Unknown command: `{}`. Try `/help`.", input));
-                                app.save_session();
-                                return Ok(());
+                                    format!("**Model set to:** `{}`", app.current_model));
                             }
+                            app.save_session();
+                            return Ok(());
+                        } else if trimmed == "/help" {
+                            app.conversation.add_message("assistant".into(),
+                                "**Commands:**\n- `/quit` or `/exit` — quit\n- `/clear` or `/new` — new session\n- `/model [name]` — show or set model\n- `/help` — this message".into());
+                            app.save_session();
+                            return Ok(());
+                        } else {
+                            app.conversation.add_message("assistant".into(),
+                                format!("Unknown command: `{}`. Try `/help`.", trimmed));
+                            app.save_session();
+                            return Ok(());
                         }
                     }
                     app.input.push_history(input.clone());

@@ -1,8 +1,9 @@
-use crate::tools::Tool;
+use crate::tools::{StreamEvent, Tool};
 use anyhow::{anyhow, Result};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use tokio::sync::mpsc;
 
 pub struct McpServer {
     _name: String,
@@ -155,7 +156,7 @@ impl Tool for McpToolAdapter {
         self.schema.clone()
     }
 
-    async fn call(&self, args: Value) -> Result<Value> {
+    async fn call(&self, args: Value, _tx: Option<mpsc::Sender<StreamEvent>>) -> Result<Value> {
         let mut server = self.server.lock().unwrap();
         server.call_tool(&self.tool_name, args)
     }

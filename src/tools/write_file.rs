@@ -1,7 +1,8 @@
-use crate::tools::Tool;
+use crate::tools::{Tool, StreamEvent};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
+use tokio::sync::mpsc;
 
 pub struct WriteFile;
 
@@ -32,7 +33,7 @@ impl Tool for WriteFile {
         })
     }
 
-    async fn call(&self, args: Value) -> Result<Value> {
+    async fn call(&self, args: Value, _tx: Option<mpsc::Sender<StreamEvent>>) -> Result<Value> {
         let path = args["file_path"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing file_path"))?;

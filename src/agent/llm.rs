@@ -187,41 +187,44 @@ impl OpenAIProvider {
                 if let Some(data) = line.strip_prefix("data: ") {
                     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
                         if let Some(usage) = parsed.get("usage") {
-                            let input_tokens = usage["prompt_tokens"].as_u64().unwrap_or(0);
-                            let output_tokens = usage["completion_tokens"].as_u64().unwrap_or(0);
+                            let input_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let output_tokens = usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
                             let _ = tx
                                 .send(StreamEvent::Usage { input_tokens, output_tokens })
                                 .await;
                         }
-                        if let Some(delta) = parsed["choices"][0]["delta"].as_object() {
-                            if let Some(content) = delta.get("content") {
-                                let _ = tx
-                                    .send(StreamEvent::Text(
-                                        content.as_str().unwrap_or("").to_string(),
-                                    ))
-                                    .await;
-                            }
-                            if let Some(tool_calls) = delta.get("tool_calls") {
-                                if let Some(calls) = tool_calls.as_array() {
-                                    for call in calls {
-                                        if let Some(func) = call["function"].as_object() {
-                                            let name = func["name"]
-                                                .as_str()
+                        if let Some(choices) = parsed.get("choices").and_then(|v| v.as_array()) {
+                            if let Some(choice) = choices.first() {
+                                if let Some(delta) = choice.get("delta").and_then(|v| v.as_object()) {
+                                    if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
+                                        let _ = tx
+                                            .send(StreamEvent::Text(content.to_string()))
+                                            .await;
+                                    }
+                                    if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                                        for call in tool_calls {
+                                            let func = call.get("function");
+                                            let name = func
+                                                .and_then(|f| f.get("name"))
+                                                .and_then(|v| v.as_str())
                                                 .unwrap_or("")
                                                 .to_string();
-                                            let args = func["arguments"]
-                                                .as_str()
+                                            let args = func
+                                                .and_then(|f| f.get("arguments"))
+                                                .and_then(|v| v.as_str())
                                                 .unwrap_or("{}");
                                             if !name.is_empty() {
+                                                let id = call
+                                                    .get("id")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("")
+                                                    .to_string();
                                                 let parsed_args: serde_json::Value =
                                                     serde_json::from_str(args)
                                                         .unwrap_or(serde_json::json!({}));
                                                 let _ = tx
                                                     .send(StreamEvent::ToolCall {
-                                                        id: call["id"]
-                                                            .as_str()
-                                                            .unwrap_or("")
-                                                            .to_string(),
+                                                        id,
                                                         name,
                                                         args: parsed_args,
                                                     })
