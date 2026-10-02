@@ -188,27 +188,57 @@ impl MarkdownRenderer {
     }
 
     fn emit_code_block<'a>(&self, lines: &mut Vec<Line<'a>>, prefix: &Span<'a>, lang: &str, code_lines: &[String]) {
+        // Tabs break width math — expand first (highlighting is unaffected).
+        let expanded: Vec<String> = code_lines.iter().map(|l| l.replace('\t', "    ")).collect();
         let lang_opt = if lang.is_empty() { None } else { Some(lang) };
         let highlighted = syntax::highlight_code_block_with_theme(
-            code_lines.iter().map(|s| s.as_str()).collect(),
+            expanded.iter().map(|s| s.as_str()).collect(),
             lang_opt,
             self.code_theme,
         );
 
         let gutter_w = code_lines.len().to_string().len().max(1);
-        for (i, (spans, _is_bold)) in highlighted.into_iter().enumerate() {
-            let mut line_spans = vec![
-                prefix.clone(),
-                Span::styled("│ ", Style::default().fg(self.muted)),
-                Span::styled(
-                    format!("{:>width$} ", i + 1, width = gutter_w),
-                    Style::default().fg(self.muted),
-                ),
-            ];
-            for (style, text) in spans {
-                line_spans.push(Span::styled(text, style));
+        let inner = self.width.saturating_sub(prefix.width() as u16) as usize;
+        // content = inner − "│ "(2) − gutter − " │"(2)
+        let content_w = inner.saturating_sub(5 + gutter_w);
+        if inner < 20 || content_w < 10 {
+            // Compact fallback: no wrapping, left border only.
+            for (i, (spans, _is_bold)) in highlighted.into_iter().enumerate() {
+                let mut line_spans = vec![
+                    prefix.clone(),
+                    Span::styled("│ ", Style::default().fg(self.muted)),
+                    Span::styled(
+                        format!("{:>width$} ", i + 1, width = gutter_w),
+                        Style::default().fg(self.muted),
+                    ),
+                ];
+                for (style, text) in spans {
+                    line_spans.push(Span::styled(text, style));
+                }
+                lines.push(Line::from(line_spans));
             }
-            lines.push(Line::from(line_spans));
+            return;
+        }
+        for (i, (spans, _is_bold)) in highlighted.into_iter().enumerate() {
+            for (vi, seg) in wrap_spans(spans, content_w).into_iter().enumerate() {
+                let gutter = if vi == 0 {
+                    format!("{:>width$} ", i + 1, width = gutter_w)
+                } else {
+                    " ".repeat(gutter_w + 1)
+                };
+                let w: usize = seg.iter().map(|(_, t)| display_width(t)).sum();
+                let mut line_spans = vec![
+                    prefix.clone(),
+                    Span::styled("│ ", Style::default().fg(self.muted)),
+                    Span::styled(gutter, Style::default().fg(self.muted)),
+                ];
+                for (style, text) in seg {
+                    line_spans.push(Span::styled(text, style));
+                }
+                line_spans.push(Span::styled(" ".repeat(content_w.saturating_sub(w)), Style::default()));
+                line_spans.push(Span::styled(" │", Style::default().fg(self.muted)));
+                lines.push(Line::from(line_spans));
+            }
         }
     }
 
@@ -392,6 +422,69 @@ impl MarkdownRenderer {
     }
 }
 
+/// Display width in terminal cells (CJK-safe).
+fn display_width(s: &str) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    s.width()
+}
+
+/// Wrap owned highlight spans to `max_width` cells, splitting styles across
+/// wrap points. Greedy with space backtrack; overlong words break mid-word.
+fn wrap_spans(spans: Vec<(Style, String)>, max_width: usize) -> Vec<Vec<(Style, String)>> {
+    use unicode_width::UnicodeWidthChar;
+    let mut cells: Vec<(Style, char)> = Vec::new();
+    for (st, text) in &spans {
+        for c in text.chars() {
+            if c == '\n' || c == '\r' {
+                continue;
+            }
+            cells.push((*st, c));
+        }
+    }
+    let row_width = |row: &[(Style, char)]| -> usize {
+        row.iter().map(|(_, c)| UnicodeWidthChar::width(*c).unwrap_or(0)).sum()
+    };
+    let mut rows: Vec<Vec<(Style, char)>> = vec![Vec::new()];
+    let mut w = 0usize;
+    let mut last_space: Option<usize> = None;
+    for (st, c) in cells {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        let cur_empty = rows.last().map(|r| r.is_empty()).unwrap_or(true);
+        if w + cw > max_width && !cur_empty {
+            if let Some(si) = last_space {
+                let cur = rows.last_mut().unwrap();
+                let tail: Vec<(Style, char)> = cur.split_off(si + 1);
+                cur.pop(); // drop the space we broke at
+                rows.push(tail);
+                w = row_width(rows.last().unwrap());
+                last_space = rows.last().unwrap().iter().rposition(|(_, ch)| *ch == ' ');
+            } else {
+                rows.push(Vec::new());
+                w = 0;
+                last_space = None;
+            }
+        }
+        rows.last_mut().unwrap().push((st, c));
+        w += cw;
+        if c == ' ' {
+            last_space = Some(rows.last().unwrap().len() - 1);
+        }
+    }
+    rows
+        .into_iter()
+        .map(|row| {
+            let mut out: Vec<(Style, String)> = Vec::new();
+            for (st, c) in row {
+                match out.last_mut() {
+                    Some(last) if last.0 == st => last.1.push(c),
+                    _ => out.push((st, c.to_string())),
+                }
+            }
+            out
+        })
+        .collect()
+}
+
 /// Byte index of a lone closing `*` in `rest` (text after the opener).
 /// `**` runs are skipped whole so bold markers never match as italic.
 fn find_closing_single_star(rest: &str) -> Option<usize> {
@@ -480,6 +573,36 @@ mod tests {
     }
 
     #[test]
+    fn long_lines_wrap_inside_borders() {
+        use unicode_width::UnicodeWidthStr;
+        let md = MarkdownRenderer::new().with_width(40);
+        let long = "x".repeat(100);
+        let text = format!("```go\n{}\n```", long);
+        let out = md.render(&text, "assistant");
+        // header + wrapped body + footer; every row exactly 40 cells.
+        assert!(out.len() > 3, "must wrap, got {} rows", out.len());
+        for (i, l) in out.iter().enumerate() {
+            let s: String = l.spans.iter().map(|s| s.content.to_string()).collect();
+            assert_eq!(s.width(), 40, "row {} width, got: {}", i, s);
+        }
+        assert!(out[0].spans.iter().any(|s| s.content.contains("go")));
+        // First body row keeps the gutter number, continuations don't.
+        assert!(out[1].spans.iter().any(|s| s.content.contains('1')));
+        assert!(out[2].spans.iter().all(|s| !s.content.contains('2') || s.content.contains('x')));
+    }
+
+    #[test]
+    fn wrap_prefers_spaces_and_keeps_styles() {
+        let md = MarkdownRenderer::new().with_width(30);
+        let out = md.render("```\nfoo bar baz qux quux corge grault\n```", "assistant");
+        // No row may split inside a word when a space break exists.
+        for l in out.iter().skip(1).take(out.len().saturating_sub(2)) {
+            let s: String = l.spans.iter().map(|s| s.content.to_string()).collect();
+            assert!(!s.contains("fo o") && !s.contains("ba r"), "split mid-word: {}", s);
+        }
+    }
+
+    #[test]
     fn quote_list_hr_task() {
         let md = MarkdownRenderer::new();
         let out = flat(&md.render("> be quoted\n- item\n1. first\n- [ ] todo\n- [x] done\n---", "assistant"));
@@ -529,8 +652,7 @@ mod tests {
     }
 
     #[test]
-    fn wide_rules_span_full_width() {
-        let md = MarkdownRenderer::new().with_width(60);
+    fn wide_rules_span_full_width() {        let md = MarkdownRenderer::new().with_width(60);
         let out = flat(&md.render("```go\nx\n```", "assistant"));
         assert_eq!(out.len(), 3, "header + 1 code + footer, got: {:?}", out);
         let header_w = out[0].chars().count();
