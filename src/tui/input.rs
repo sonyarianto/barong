@@ -158,6 +158,138 @@ pub fn model_label(provider: &str, model: &str) -> String {
     }
 }
 
+/// Commands whose argument is a fixed choice set get the generic picker.
+/// Free-form commands (/branch name, /export path) intentionally don't.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ChoiceMode {
+    Theme,
+    Approve,
+    Compact,
+    Allow,
+    Resume,
+    Logout,
+}
+
+/// (mode, filter) when the buffer is in a generic-picker command.
+pub fn choice_mode(buffer: &str) -> Option<(ChoiceMode, String)> {
+    for (prefix, mode) in [
+        ("/theme ", ChoiceMode::Theme),
+        ("/approve ", ChoiceMode::Approve),
+        ("/compact ", ChoiceMode::Compact),
+        ("/allow ", ChoiceMode::Allow),
+        ("/resume ", ChoiceMode::Resume),
+        ("/logout ", ChoiceMode::Logout),
+    ] {
+        if let Some(filter) = buffer.strip_prefix(prefix) {
+            return Some((mode, filter.to_string()));
+        }
+    }
+    None
+}
+
+pub fn choice_title(mode: &ChoiceMode) -> &'static str {
+    match mode {
+        ChoiceMode::Theme => " theme ",
+        ChoiceMode::Approve => " approve ",
+        ChoiceMode::Compact => " compact ",
+        ChoiceMode::Allow => " allow ",
+        ChoiceMode::Resume => " resume ",
+        ChoiceMode::Logout => " logout ",
+    }
+}
+
+pub fn choice_prefix(mode: &ChoiceMode) -> &'static str {
+    match mode {
+        ChoiceMode::Theme => "/theme ",
+        ChoiceMode::Approve => "/approve ",
+        ChoiceMode::Compact => "/compact ",
+        ChoiceMode::Allow => "/allow ",
+        ChoiceMode::Resume => "/resume ",
+        ChoiceMode::Logout => "/logout ",
+    }
+}
+
+/// (value, description) rows for a generic picker. Values submit as-is.
+pub fn choice_entries(app: &App, mode: &ChoiceMode, filter: &str) -> Vec<(String, String)> {
+    let q = filter.trim().to_lowercase();
+    let mut out: Vec<(String, String)> = match mode {
+        ChoiceMode::Theme => crate::tui::theme::all_themes()
+            .into_iter()
+            .map(|(n, d)| {
+                let cur = if n == app.theme.name { " (current)" } else { "" };
+                (n.to_string(), format!("{}{}", d, cur))
+            })
+            .collect(),
+        ChoiceMode::Approve => {
+            let on = app.permission_gate.auto_approve();
+            vec![
+                ("on".into(), format!("auto-approve mutating tools{}", if on { " (current)" } else { "" })),
+                ("off".into(), format!("ask every time{}", if !on { " (current)" } else { "" })),
+            ]
+        }
+        ChoiceMode::Compact => vec![
+            ("10".into(), "keep last 10 messages".into()),
+            ("20".into(), "keep last 20 messages".into()),
+            ("50".into(), "keep last 50 messages".into()),
+            ("auto on".into(), "auto-compact at ctx ≥85%".into()),
+            ("auto off".into(), "manual /compact only".into()),
+        ],
+        ChoiceMode::Allow => ["write", "edit", "bash", "delegate", "all"]
+            .iter()
+            .map(|t| {
+                let scope = if *t == "all" { "write,edit,bash,delegate" } else { t };
+                let state = if scope.split(',').all(|x| app.permission_gate.is_session_allowed(x)) {
+                    " (allowed)"
+                } else {
+                    ""
+                };
+                (t.to_string(), format!("allow {}{}", scope, state))
+            })
+            .collect(),
+        ChoiceMode::Resume => {
+            let mut sessions = app.session_manager.list_sessions();
+            sessions.sort_by(|a, b| b.updated.cmp(&a.updated));
+            sessions
+                .into_iter()
+                .take(10)
+                .map(|s| (s.id.clone(), format!("{} msgs · {}", s.messages.len(), crate::session::SessionManager::title(&s))))
+                .collect()
+        }
+        ChoiceMode::Logout => app
+            .config
+            .all_provider_ids()
+            .into_iter()
+            .filter(|pid| app.auth.has(pid))
+            .map(|pid| (pid.clone(), "remove saved key".into()))
+            .collect(),
+    };
+    if !q.is_empty() {
+        out.retain(|(v, d)| v.to_lowercase().contains(&q) || d.to_lowercase().contains(&q));
+    }
+    out.truncate(12);
+    out
+}
+
+/// Resolve the effective argument for choice commands: a picked value when
+/// the generic picker chose something (arrow-navigated, or empty filter
+/// meaning "confirm highlight"). Consumes the navigation flag.
+/// Returns None when the typed text should flow through untouched.
+fn take_choice(app: &mut App, mode: &ChoiceMode, arg: &str) -> Option<String> {
+    if !app.choice_navigated && !arg.is_empty() {
+        return None;
+    }
+    let items = choice_entries(app, mode, arg);
+    app.choice_navigated = false;
+    if items.is_empty() {
+        app.choice_idx = 0;
+        return None;
+    }
+    let idx = app.choice_idx % items.len();
+    let v = items[idx].0.clone();
+    app.choice_idx = 0;
+    Some(v)
+}
+
 /// One entry in the `/model` picker: (provider, model, key-ready).
 pub fn model_entries(app: &App, filter: &str) -> Vec<(String, String, bool)> {
     let q = filter.trim().to_lowercase();
@@ -300,9 +432,13 @@ fn bare_enter(buffer: &str, palette_idx: usize, navigated: bool) -> Option<BareE
         // Never .trim() here: "/login " trimmed looks bare but isn't.
         return None;
     }
-    // Bare `/login` opens the interactive provider picker instead of submitting.
-    if buffer.trim() == "/login" {
-        return Some(BareEnter::Complete("/login ".into()));
+    // Bare picker commands open their picker instead of submitting.
+    // (Free-form commands like /branch and /export submit as before.)
+    const PICKER_COMMANDS: &[&str] = &[
+        "/login", "/model", "/theme", "/approve", "/compact", "/allow", "/resume", "/logout",
+    ];
+    if PICKER_COMMANDS.contains(&buffer.trim()) {
+        return Some(BareEnter::Complete(format!("{} ", buffer.trim())));
     }
     if navigated {
         let items = command_palette(buffer);
@@ -311,11 +447,6 @@ fn bare_enter(buffer: &str, palette_idx: usize, navigated: bool) -> Option<BareE
         }
         let (name, _) = items[palette_idx % items.len()];
         return Some(BareEnter::Complete(format!("{} ", name)));
-    }
-    // Bare `/model` opens its picker (highlight = active model) instead of
-    // dumping a static list — symmetric with `/login`.
-    if buffer.trim() == "/model" {
-        return Some(BareEnter::Complete("/model ".into()));
     }
     let trimmed = buffer.trim();
     if all_commands().iter().any(|(n, _)| *n == trimmed) {
@@ -619,6 +750,8 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                 app.model_navigated = false;
                 app.login_idx = 0;
                 app.login_navigated = false;
+                app.choice_idx = 0;
+                app.choice_navigated = false;
             }
             KeyCode::Backspace => {
                 if app.input.cursor_pos > 0 && !app.input.buffer.is_empty() {
@@ -638,6 +771,8 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                 app.model_navigated = false;
                 app.login_idx = 0;
                 app.login_navigated = false;
+                app.choice_idx = 0;
+                app.choice_navigated = false;
             }
             KeyCode::Delete => {
                 if app.input.cursor_pos < app.input.buffer.len() {
@@ -672,6 +807,14 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                     }
                     return Ok(());
                 }
+                if let Some((mode, f)) = choice_mode(&app.input.buffer) {
+                    let items = choice_entries(app, &mode, &f);
+                    if !items.is_empty() {
+                        app.choice_idx = (app.choice_idx + items.len() - 1) % items.len();
+                        app.choice_navigated = true;
+                    }
+                    return Ok(());
+                }
                 if app.input.buffer.starts_with('/') {
                     let items = command_palette(&app.input.buffer);
                     if !items.is_empty() {
@@ -697,6 +840,14 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                     if !items.is_empty() {
                         app.login_idx = (app.login_idx + 1) % items.len();
                         app.login_navigated = true;
+                    }
+                    return Ok(());
+                }
+                if let Some((mode, f)) = choice_mode(&app.input.buffer) {
+                    let items = choice_entries(app, &mode, &f);
+                    if !items.is_empty() {
+                        app.choice_idx = (app.choice_idx + 1) % items.len();
+                        app.choice_navigated = true;
                     }
                     return Ok(());
                 }
@@ -730,6 +881,15 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                         app.input.cursor_pos = app.input.buffer.len();
                         app.login_idx = 0;
                         app.login_navigated = false;
+                    }
+                } else if let Some((mode, f)) = choice_mode(&app.input.buffer) {
+                    let items = choice_entries(app, &mode, &f);
+                    if !items.is_empty() {
+                        let idx = app.choice_idx % items.len();
+                        app.input.buffer = format!("{}{} ", choice_prefix(&mode), items[idx].0);
+                        app.input.cursor_pos = app.input.buffer.len();
+                        app.choice_idx = 0;
+                        app.choice_navigated = false;
                     }
                 } else if app.input.buffer.starts_with('/') {
                     complete_palette(app);
@@ -805,6 +965,7 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                     app.palette_navigated = false;
                     app.model_navigated = false;
                     app.login_navigated = false;
+                    app.choice_navigated = false;
                 }
             }
             KeyCode::PageUp => {
@@ -989,6 +1150,8 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
             return Ok(true);
         }
         "/logout" => {
+            let picked = take_choice(app, &ChoiceMode::Logout, arg);
+            let arg = picked.as_deref().unwrap_or(arg);
             if arg.is_empty() {
                 app.conversation.add_message("assistant".into(), "Usage: `/logout <provider>`".into());
             } else {
@@ -1013,6 +1176,8 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
             return Ok(true);
         }
         "/allow" => {
+            let picked = take_choice(app, &ChoiceMode::Allow, arg);
+            let arg = picked.as_deref().unwrap_or(arg);
             if arg.is_empty() {
                 let allowed: Vec<String> = ["write", "edit", "bash", "delegate"]
                     .iter()
@@ -1037,6 +1202,8 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
             return Ok(true);
         }
         "/approve" => {
+            let picked = take_choice(app, &ChoiceMode::Approve, arg);
+            let arg = picked.as_deref().unwrap_or(arg);
             if arg.eq_ignore_ascii_case("on") || arg == "1" || arg.eq_ignore_ascii_case("yes") {
                 app.permission_gate.set_auto_approve(true);
                 app.conversation.add_message("assistant".into(), "Auto-approve **on** — mutating tools run without asking.".into());
@@ -1073,6 +1240,8 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
             return Ok(true);
         }
         "/resume" => {
+            let picked = take_choice(app, &ChoiceMode::Resume, arg);
+            let arg = picked.as_deref().unwrap_or(arg);
             if arg.is_empty() {
                 let mut sessions = app.session_manager.list_sessions();
                 sessions.sort_by(|a, b| b.updated.cmp(&a.updated));
@@ -1089,6 +1258,15 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
             } else if let Some(s) = app.session_manager.load(arg) {
                 app.conversation.messages = s.messages;
                 app.session_id = Some(s.id.clone());
+                // Resume the endpoint the session was saved with, not today's.
+                if let (Some(p), Some(m)) = (s.provider.clone(), s.model.clone()) {
+                    if app.config.resolve_provider_config(&p).known && !m.trim().is_empty() {
+                        let _ = app.apply_provider_model(&p, &m);
+                    }
+                }
+                if let Some(t) = s.theme.clone() {
+                    app.set_theme(&t);
+                }
                 app.is_home = false;
                 app.streaming_text.clear();
                 app.conversation.add_message("assistant".into(), format!("Resumed `{}`", s.id));
@@ -1129,6 +1307,8 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
             return Ok(true);
         }
         "/compact" => {
+            let picked = take_choice(app, &ChoiceMode::Compact, arg);
+            let arg = picked.as_deref().unwrap_or(arg);
             let mut parts = arg.split_whitespace();
             let first = parts.next().unwrap_or("");
             if first.eq_ignore_ascii_case("auto") {
@@ -1162,14 +1342,10 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
             return Ok(true);
         }
         "/theme" => {
+            let picked = take_choice(app, &ChoiceMode::Theme, arg);
+            let arg = picked.as_deref().unwrap_or(arg);
             if arg.is_empty() {
-                let mut out = String::from("**Themes:**\n");
-                for (n, d) in crate::tui::theme::all_themes() {
-                    let cur = if n == app.theme.name { " (current)" } else { "" };
-                    out.push_str(&format!("- `{}` — {}{}\n", n, d, cur));
-                }
-                out.push_str("\nUse `/theme <name>`");
-                app.conversation.add_message("assistant".into(), out);
+                app.conversation.add_message("assistant".into(), "**Themes:** dark · light · barong\nUsage: `/theme <name>`".into());
             } else {
                 let names: Vec<&str> = crate::tui::theme::all_themes().iter().map(|(n, _)| *n).collect();
                 if names.contains(&arg.to_lowercase().as_str()) {
@@ -1435,6 +1611,53 @@ mod tests {
         assert_eq!(bare_enter("/login", 0, false), Some(BareEnter::Complete("/login ".into())));
         // Removed `/models` alias: unknown text falls through.
         assert_eq!(bare_enter("/models", 0, false), None);
+    }
+
+    #[test]
+    fn bare_enter_all_choice_commands_open_pickers() {
+        for cmd in ["/theme", "/approve", "/compact", "/allow", "/resume", "/logout"] {
+            assert_eq!(
+                bare_enter(cmd, 0, false),
+                Some(BareEnter::Complete(format!("{} ", cmd))),
+                "{} must open its picker",
+                cmd
+            );
+        }
+        // Free-form commands still submit.
+        assert_eq!(bare_enter("/branch", 0, false), Some(BareEnter::Submit));
+        assert_eq!(bare_enter("/tree", 0, false), Some(BareEnter::Submit));
+    }
+
+    #[test]
+    fn theme_picker_applies_highlight() {
+        let mut app = test_app();
+        app.set_theme("light");
+        assert_eq!(app.theme.name, "light");
+        app.choice_navigated = true;
+        app.choice_idx = 2; // dark, light, barong
+        handle_slash(&mut app, "/theme ").unwrap();
+        assert_eq!(app.theme.name, "barong");
+    }
+
+    #[test]
+    fn resume_picker_restores_endpoint_too() {
+        let mut app = test_app();
+        app.auth.set("nvidia", "nvapi-test-key");
+        app.conversation.add_message("user".into(), "hello nvidia".into());
+        handle_slash(&mut app, "/model nvidia").unwrap();
+        let saved_id = app.session_id.clone().expect("saved");
+        // Wipe to a fresh state on another provider (poked directly to avoid
+        // saving a new session that would shadow the nvidia one), then resume.
+        handle_slash(&mut app, "/clear").unwrap();
+        app.provider_name = "openai".into();
+        app.current_model = "gpt-4o".into();
+        assert_eq!(app.provider_name, "openai");
+        app.choice_navigated = true;
+        app.choice_idx = 0; // most recent first
+        handle_slash(&mut app, "/resume ").unwrap();
+        assert_eq!(app.session_id.as_deref(), Some(saved_id.as_str()));
+        assert_eq!(app.provider_name, "nvidia");
+        assert!(app.conversation.messages.iter().any(|m| m.content.as_deref().unwrap_or("").contains("hello nvidia")));
     }
 
     #[test]

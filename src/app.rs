@@ -59,6 +59,9 @@ pub struct App {
     pub model_navigated: bool,
     pub login_idx: usize,
     pub login_navigated: bool,
+    /// Generic choice picker (theme/approve/compact/allow/resume/logout).
+    pub choice_idx: usize,
+    pub choice_navigated: bool,
 }
 
 impl App {
@@ -186,6 +189,8 @@ impl App {
             model_navigated: false,
             login_idx: 0,
             login_navigated: false,
+            choice_idx: 0,
+            choice_navigated: false,
         }
     }
 
