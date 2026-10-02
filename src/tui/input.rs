@@ -236,17 +236,22 @@ fn handle_login_key(app: &mut App, key: crossterm::event::KeyEvent) -> Result<()
                     app.notice = Some("empty key — login cancelled".into());
                 } else {
                     app.auth.set(&pid, entered.trim());
-                    // Refresh active-provider key status only when we just
-                    // saved a key for it; otherwise leave it alone.
-                    if pid == app.provider_name {
-                        let (_, src) = crate::auth::resolve_api_key(&pid, &app.auth, &app.config);
-                        app.key_source = src;
+                    // The point of /login is to USE the provider: switch to it
+                    // right away so no separate `/model <provider>` is needed.
+                    let def = app.config.resolve_default_model(&pid);
+                    match app.apply_provider_model(&pid, &def) {
+                        Ok(_) => {
+                            app.notice = Some(format!("saved key + switched to '{}/{}'", pid, def));
+                            app.conversation.add_message(
+                                "assistant".into(),
+                                format!("API key saved for `{}`. Switched to `{}` — ready to chat.", pid, model_label(&pid, &def)),
+                            );
+                        }
+                        Err(e) => {
+                            app.notice = Some(format!("saved key for '{}'", pid));
+                            app.conversation.add_message("assistant".into(), e);
+                        }
                     }
-                    app.notice = Some(format!("saved key for '{}'", pid));
-                    app.conversation.add_message(
-                        "assistant".into(),
-                        format!("API key saved for `{}`. Try `/model {}`.", pid, pid),
-                    );
                     app.save_session();
                     app.is_home = false;
                 }
@@ -856,17 +861,24 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
                 app.login_navigated = false;
                 app.login_idx = 0;
             } else if arg.is_empty() {
-                let mut out = String::from("**Providers:**\n");
-                for pid in app.config.all_provider_ids() {
-                    let (key, src) = crate::auth::resolve_api_key(&pid, &app.auth, &app.config);
-                    let rpc = app.config.resolve_provider_config(&pid);
-                    let mark = if key.is_empty() { "○" } else { "●" };
-                    let where_ = if key.is_empty() { "no key" } else { src };
-                    let base = if rpc.base_url.is_empty() { "(default endpoint)".into() } else { rpc.base_url.clone() };
-                    out.push_str(&format!("- {} `{}` — {} · {}\n", mark, pid, where_, base));
+                // Picker is open with nothing typed: confirm the highlighted
+                // entry — first provider still missing a key, else the first.
+                let items = provider_entries(app, "");
+                let pick = items
+                    .iter()
+                    .find(|(_, ready, _)| !ready)
+                    .or_else(|| items.first());
+                match pick {
+                    Some((pid, _, _)) => {
+                        let pid = pid.clone();
+                        app.pending_login = Some(pid.clone());
+                        app.login_buffer.clear();
+                        app.notice = Some(format!("paste API key for '{}' — Enter saves, Esc cancels", pid));
+                    }
+                    None => {
+                        app.notice = Some("no providers configured".into());
+                    }
                 }
-                out.push_str("\n`●` ready · `○` needs key\nUsage: `/login <provider>` then paste the key (kept in `~/.barong/auth.json`, never in project files)");
-                app.conversation.add_message("assistant".into(), out);
             } else {
                 let pid = arg.split_whitespace().next().unwrap_or("").to_lowercase();
                 let rpc = app.config.resolve_provider_config(&pid);
@@ -1223,22 +1235,32 @@ mod tests {
     }
 
     #[test]
-    fn login_message_reports_saved_provider_not_active() {
+    fn login_save_auto_switches_to_provider() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut app = test_app();
         // Active provider is openai (no key); we save a key for nvidia.
+        assert_eq!(app.provider_name, "openai");
         app.pending_login = Some("nvidia".into());
         for c in "nvapi-test-key".chars() {
             let ev = KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty());
             super::handle_login_key(&mut app, ev).unwrap();
         }
-        // Simulate Enter via the real handler.
         let ev = KeyEvent::new(KeyCode::Enter, KeyModifiers::empty());
         super::handle_login_key(&mut app, ev).unwrap();
         assert_eq!(app.auth.get("nvidia").as_deref(), Some("nvapi-test-key"));
+        // No separate `/model` step needed: session follows the login.
+        assert_eq!(app.provider_name, "nvidia");
+        assert_eq!(app.current_model, "deepseek-ai/deepseek-r1");
         let last = app.conversation.messages.last().and_then(|m| m.content.clone()).unwrap_or_default();
-        assert!(last.contains("API key saved for `nvidia`"), "got: {}", last);
-        assert!(!last.contains("missing"), "must not report active-provider status, got: {}", last);
+        assert!(last.contains("Switched to `nvidia/deepseek-ai/deepseek-r1`"), "got: {}", last);
+    }
+
+    #[test]
+    fn login_empty_enter_picks_first_keyless_provider() {
+        let mut app = test_app();
+        handle_slash(&mut app, "/login ").unwrap();
+        // ollama is always ready (dummy) so it must be skipped.
+        assert_eq!(app.pending_login.as_deref(), Some("anthropic"));
     }
 
     #[test]
