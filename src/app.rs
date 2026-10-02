@@ -2,6 +2,7 @@ use crate::agent::r#loop::start_agent_loop_with_limit;
 use crate::agent::conversation::Conversation;
 use crate::agent::llm::{LLMProvider, OpenAIProvider, AnthropicProvider, StreamEvent, ProviderKind};
 use crate::agent::permissions::{Decision, PendingTool, PermissionGate};
+use crate::auth::{resolve_api_key, AuthStore};
 use crate::config::Config;
 use crate::mcp::{McpServer, McpToolAdapter};
 use crate::session::SessionManager;
@@ -32,6 +33,8 @@ pub struct App {
     pub event_rx: Option<mpsc::Receiver<StreamEvent>>,
     pub streaming_text: String,
     pub provider: ProviderKind,
+    pub provider_name: String,
+    pub base_url: String,
     pub current_model: String,
     pub cancelled: Arc<AtomicBool>,
     pub is_home: bool,
@@ -44,6 +47,12 @@ pub struct App {
     pub pending_approval: Option<PendingTool>,
     pub theme: Theme,
     pub tree_visible: bool,
+    pub auth: AuthStore,
+    pub key_source: &'static str,
+    pub pending_login: Option<String>,
+    pub login_buffer: String,
+    pub model_idx: usize,
+    pub model_navigated: bool,
 }
 
 impl App {
@@ -53,9 +62,20 @@ impl App {
     }
 
     pub fn new_with_config(config: Config, cli_extra_tools: Vec<String>) -> Self {
-        let provider_str = config.resolve_provider();
-        let provider = ProviderKind::from_str(&provider_str);
-        let current_model = config.resolve_model(&provider_str);
+        let provider_name = config.resolve_provider();
+        let rpc = config.resolve_provider_config(&provider_name);
+        let provider = ProviderKind::from_str(&rpc.api);
+        let current_model = config
+            .model
+            .clone()
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| config.resolve_default_model(&provider_name));
+        let base_url = if rpc.base_url.is_empty() {
+            config.resolve_base_url()
+        } else {
+            rpc.base_url.clone()
+        };
         let mut extras = config.resolve_extra_tools();
         extras.extend(cli_extra_tools);
         let mut tool_registry = ToolRegistry::new().with_extras(&extras);
@@ -65,14 +85,18 @@ impl App {
         let session_id = session_manager.most_recent_session().map(|s| s.id);
 
         let mcp_servers = Self::init_mcp(&config, &mut tool_registry);
+        let auth = AuthStore::new();
+        let (delegate_key, _) = resolve_api_key(&provider_name, &auth, &config);
+        let delegate_base = base_url.clone();
+        let delegate_model = current_model.clone();
         // delegate is opt-in extra (no sub-agents in core)
         if extras.iter().any(|e| {
             e.eq_ignore_ascii_case("delegate") || e.eq_ignore_ascii_case("all")
         }) {
             tool_registry.register_delegate(
-                config.resolve_api_key(&provider_str),
-                config.resolve_model(&provider_str),
-                config.resolve_base_url(),
+                delegate_key,
+                delegate_model,
+                delegate_base,
                 provider,
             );
         }
@@ -80,6 +104,7 @@ impl App {
         let tool_registry = Arc::new(tool_registry);
         let permission_gate = PermissionGate::new(config.resolve_auto_approve());
         let theme = theme::resolve(&config.resolve_theme());
+        let (initial_key, key_source) = resolve_api_key(&provider_name, &auth, &config);
 
         Self {
             conversation,
@@ -97,18 +122,98 @@ impl App {
             event_rx: None,
             streaming_text: String::new(),
             provider,
+            provider_name: provider_name.clone(),
+            base_url: base_url.clone(),
             current_model: current_model.clone(),
             cancelled: Arc::new(AtomicBool::new(false)),
             is_home: true,
             palette_idx: 0,
             tool_expanded: false,
-            notice: None,
+            notice: if initial_key.is_empty() {
+                Some(format!("no API key for '{}' — /login {} or set env", provider_name, provider_name))
+            } else {
+                None
+            },
             spinner_tick: 0,
             permission_gate,
             pending_approval: None,
             theme,
             tree_visible: false,
+            auth,
+            key_source,
+            pending_login: None,
+            login_buffer: String::new(),
+            model_idx: 0,
+            model_navigated: false,
         }
+    }
+
+    /// Switch provider+model for this session (from `/model`).
+    /// `provider_id` must be known or user-configured; model may be free-form.
+    pub fn apply_provider_model(&mut self, provider_id: &str, model: &str) -> Result<(), String> {
+        let id = provider_id.trim().to_lowercase();
+        let rpc = self.config.resolve_provider_config(&id);
+        if !rpc.known {
+            return Err(format!("unknown provider '{}'. Known: {}. Custom endpoints go in barong.jsonc `providers`.", id, self.config.all_provider_ids().join(", ")));
+        }
+        self.provider = ProviderKind::from_str(&rpc.api);
+        self.provider_name = id.clone();
+        self.base_url = if rpc.base_url.is_empty() {
+            self.config.resolve_base_url()
+        } else {
+            rpc.base_url.clone()
+        };
+        self.current_model = model.trim().to_string();
+        self.status.model = self.current_model.clone();
+        let (key, src) = resolve_api_key(&id, &self.auth, &self.config);
+        self.key_source = src;
+        if key.is_empty() {
+            self.notice = Some(format!("no API key for '{}' — /login {}", id, id));
+        }
+        Ok(())
+    }
+
+    /// Parse `provider/model...` (split at first `/`) or a bare model id
+    /// for the current provider.
+    pub fn parse_model_arg(&self, arg: &str) -> Option<(String, String)> {
+        let t = arg.trim();
+        if t.is_empty() {
+            return None;
+        }
+        if let Some(i) = t.find('/') {
+            let p = t[..i].trim().to_lowercase();
+            let m = t[i + 1..].trim().to_string();
+            if p.is_empty() || m.is_empty() {
+                return None;
+            }
+            Some((p, m))
+        } else {
+            Some((self.provider_name.clone(), t.to_string()))
+        }
+    }
+
+    /// Apply `--provider` / `--model` CLI overrides in TUI mode.
+    pub fn apply_cli_overrides(&mut self, provider: Option<&str>, model: Option<&str>) {
+        if let Some(p) = provider.map(str::trim).filter(|s| !s.is_empty()) {
+            let def = self.config.resolve_default_model(p);
+            if let Err(e) = self.apply_provider_model(p, &def) {
+                self.notice = Some(e);
+            }
+        }
+        if let Some(m) = model.map(str::trim).filter(|s| !s.is_empty()) {
+            match self.parse_model_arg(m) {
+                Some((p, mm)) => {
+                    if let Err(e) = self.apply_provider_model(&p, &mm) {
+                        self.notice = Some(e);
+                    }
+                }
+                None => self.notice = Some(format!("bad --model '{}', use provider/model", m)),
+            }
+        }
+    }
+
+    pub fn api_key(&self) -> String {
+        resolve_api_key(&self.provider_name, &self.auth, &self.config).0
     }
 
     pub fn set_theme(&mut self, name: &str) {
@@ -314,14 +419,22 @@ impl App {
         );
         self.conversation.set_system_prompt(system_prompt);
 
+        let api_key = self.api_key();
+        if api_key.is_empty() {
+            let msg = format!("No API key for '{}'. Run `/login {}` or set env.", self.provider_name, self.provider_name);
+            self.conversation.add_message("assistant".into(), msg);
+            self.save_session();
+            self.is_home = false;
+            return;
+        }
         let provider: Box<dyn LLMProvider> = match self.provider {
             ProviderKind::OpenAI => Box::new(OpenAIProvider::new(
-                self.config.resolve_api_key("openai"),
+                api_key,
                 self.current_model.clone(),
-                self.config.resolve_base_url(),
+                self.base_url.clone(),
             )),
             ProviderKind::Anthropic => Box::new(AnthropicProvider::new(
-                self.config.resolve_api_key("anthropic"),
+                api_key,
                 self.current_model.clone(),
                 self.config.resolve_max_tokens(),
             )),

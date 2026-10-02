@@ -87,7 +87,9 @@ pub fn all_commands() -> Vec<(&'static str, &'static str)> {
         ("/copy", "copy last assistant message"),
         ("/compact", "compact context — /compact [keep=20] | /compact auto on|off"),
         ("/clear", "clear screen (same as /new)"),
-        ("/model", "show or set model — /model [name]"),
+        ("/model", "pick provider/model — /model [provider/model]"),
+        ("/login", "save API key — /login [provider]"),
+        ("/logout", "remove saved key — /logout <provider>"),
         ("/tools", "list available tools"),
         ("/allow", "allow tool — /allow <tool|all>"),
         ("/approve", "auto-approve mode — /approve on|off"),
@@ -119,6 +121,99 @@ fn handle_permission_key(app: &mut App, code: crossterm::event::KeyCode) -> Resu
         _ => {
             app.notice = Some("y=allow once · a=always · n=deny".into());
         }
+    }
+    return Ok(());
+}
+
+/// One entry in the `/model` picker: (provider, model, key-ready).
+pub fn model_entries(app: &App, filter: &str) -> Vec<(String, String, bool)> {
+    let q = filter.trim().to_lowercase();
+    let mut out = Vec::new();
+    for pid in app.config.all_provider_ids() {
+        let rpc = app.config.resolve_provider_config(&pid);
+        for m in &rpc.models {
+            if q.is_empty() || pid.contains(&q) || m.to_lowercase().contains(&q) {
+                let ready = !crate::auth::resolve_api_key(&pid, &app.auth, &app.config).0.is_empty();
+                out.push((pid.clone(), m.clone(), ready));
+            }
+        }
+        // Free-form fallback: typed `provider/model` for a known provider
+        // whose catalog doesn't list it (e.g. new OpenRouter ids).
+        if !q.is_empty() && q.starts_with(&format!("{}/", pid)) && q.len() > pid.len() + 1 {
+            let custom = filter.trim().to_string();
+            let custom = custom[pid.len() + 1..].trim().to_string();
+            if !custom.is_empty() && !rpc.models.iter().any(|m| m.eq_ignore_ascii_case(&custom)) {
+                let ready = !crate::auth::resolve_api_key(&pid, &app.auth, &app.config).0.is_empty();
+                out.push((pid.clone(), custom, ready));
+            }
+        }
+    }
+    // Ready providers first, then alphabetical.
+    out.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1)));
+    out.truncate(30);
+    out
+}
+
+fn handle_login_key(app: &mut App, key: crossterm::event::KeyEvent) -> Result<()> {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    // Esc cancels outright.
+    if key.code == KeyCode::Esc {
+        app.pending_login = None;
+        app.login_buffer.clear();
+        app.notice = Some("login cancelled".into());
+        return Ok(());
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Char('c') => {
+                if app.login_buffer.is_empty() {
+                    app.pending_login = None;
+                } else {
+                    app.login_buffer.clear();
+                }
+                return Ok(());
+            }
+            KeyCode::Char('u') | KeyCode::Char('w') => {
+                app.login_buffer.clear();
+                return Ok(());
+            }
+            _ => return Ok(()),
+        }
+    }
+    match key.code {
+        KeyCode::Char(c) => {
+            if !key.modifiers.contains(KeyModifiers::ALT) {
+                app.login_buffer.push(c);
+            }
+        }
+        KeyCode::Backspace => {
+            app.login_buffer.pop();
+        }
+        KeyCode::Enter => {
+            if let Some(pid) = app.pending_login.take() {
+                let entered = std::mem::take(&mut app.login_buffer);
+                if entered.trim().is_empty() {
+                    app.notice = Some("empty key — login cancelled".into());
+                } else {
+                    app.auth.set(&pid, entered.trim());
+                    // Re-resolve in case this is the active provider.
+                    let (k, src) = crate::auth::resolve_api_key(&app.provider_name, &app.auth, &app.config);
+                    app.key_source = src;
+                    if k.is_empty() {
+                        app.notice = Some(format!("saved key for '{}'", pid));
+                    } else {
+                        app.notice = Some(format!("saved key for '{}' ({})", pid, src));
+                    }
+                    app.conversation.add_message(
+                        "assistant".into(),
+                        format!("API key saved for `{}` ({}). Try `/model {}/…`.", pid, src, pid),
+                    );
+                    app.save_session();
+                    app.is_home = false;
+                }
+            }
+        }
+        _ => {}
     }
     return Ok(());
 }
@@ -289,9 +384,14 @@ pub fn handle_events(app: &mut App) -> Result<()> {
         if key.kind != KeyEventKind::Press {
             return Ok(());
         }
+
         // Permission modal takes over all keys while pending.
         if app.pending_approval.is_some() {
             return handle_permission_key(app, key.code);
+        }
+        // API-key entry mode takes over all keys while pending.
+        if app.pending_login.is_some() {
+            return handle_login_key(app, key);
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -385,6 +485,8 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                 app.input.buffer.insert(app.input.cursor_pos, c);
                 app.input.cursor_pos += 1;
                 app.palette_idx = 0;
+                app.model_idx = 0;
+                app.model_navigated = false;
             }
             KeyCode::Backspace => {
                 if app.input.cursor_pos > 0 && !app.input.buffer.is_empty() {
@@ -399,6 +501,8 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                     }
                 }
                 app.palette_idx = 0;
+                app.model_idx = 0;
+                app.model_navigated = false;
             }
             KeyCode::Delete => {
                 if app.input.cursor_pos < app.input.buffer.len() {
@@ -416,6 +520,15 @@ pub fn handle_events(app: &mut App) -> Result<()> {
             KeyCode::Home => app.input.cursor_pos = 0,
             KeyCode::End => app.input.cursor_pos = app.input.buffer.len(),
             KeyCode::Up => {
+                if app.input.buffer.starts_with("/model ") {
+                    let filter = app.input.buffer["/model ".len()..].to_string();
+                    let items = model_entries(app, &filter);
+                    if !items.is_empty() {
+                        app.model_idx = (app.model_idx + items.len() - 1) % items.len();
+                        app.model_navigated = true;
+                    }
+                    return Ok(());
+                }
                 if app.input.buffer.starts_with('/') {
                     let items = command_palette(&app.input.buffer);
                     if !items.is_empty() {
@@ -426,6 +539,15 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                 app.input.navigate_history(-1);
             }
             KeyCode::Down => {
+                if app.input.buffer.starts_with("/model ") {
+                    let filter = app.input.buffer["/model ".len()..].to_string();
+                    let items = model_entries(app, &filter);
+                    if !items.is_empty() {
+                        app.model_idx = (app.model_idx + 1) % items.len();
+                        app.model_navigated = true;
+                    }
+                    return Ok(());
+                }
                 if app.input.buffer.starts_with('/') {
                     let items = command_palette(&app.input.buffer);
                     if !items.is_empty() {
@@ -436,7 +558,18 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                 app.input.navigate_history(1);
             }
             KeyCode::Tab => {
-                if app.input.buffer.starts_with('/') {
+                if app.input.buffer.starts_with("/model ") {
+                    let filter = app.input.buffer["/model ".len()..].to_string();
+                    let items = model_entries(app, &filter);
+                    if !items.is_empty() {
+                        let idx = app.model_idx % items.len();
+                        let (p, m, _) = &items[idx];
+                        app.input.buffer = format!("/model {}/{} ", p, m);
+                        app.input.cursor_pos = app.input.buffer.len();
+                        app.model_idx = 0;
+                        app.model_navigated = false;
+                    }
+                } else if app.input.buffer.starts_with('/') {
                     complete_palette(app);
                 } else if app.input.buffer.contains('@') {
                     complete_mention(app);
@@ -547,11 +680,109 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
         }
         "/model" => {
             if arg.is_empty() {
-                app.conversation.add_message("assistant".into(), format!("**Model:** `{}`\nUsage: `/model <name>`", app.current_model));
+                let mut out = format!(
+                    "**Provider:** `{}`\n**Model:** `{}`\n**Key:** {} ({})\n\n**Ready models:**\n",
+                    app.provider_name, app.current_model, if app.api_key().is_empty() { "missing" } else { "set" }, app.key_source,
+                );
+                for (p, m, ready) in model_entries(app, "").iter().take(12) {
+                    out.push_str(&format!("- {} `{}/{}`\n", if *ready { "●" } else { "○" }, p, m));
+                }
+                out.push_str("\nUsage: `/model <provider/model>` or `/model <text>` + ↑↓ + Enter\n`○` = no key yet — `/login <provider>`");
+                app.conversation.add_message("assistant".into(), out);
+            } else if app.model_navigated {
+                // Enter after arrow-key navigation: use highlighted picker entry.
+                let items = model_entries(app, arg);
+                if items.is_empty() {
+                    app.conversation.add_message("assistant".into(), "No matching models.".into());
+                } else {
+                    let idx = app.model_idx % items.len();
+                    let (p, m, ready) = items[idx].clone();
+                    match app.apply_provider_model(&p, &m) {
+                        Ok(_) => {
+                            let warn = if !ready { " (no key yet — `/login` to activate)".to_string() } else { String::new() };
+                            app.conversation.add_message("assistant".into(), format!("**Model set to:** `{}/{}`{}", p, m, warn));
+                        }
+                        Err(e) => app.conversation.add_message("assistant".into(), e),
+                    }
+                }
+                app.model_navigated = false;
+                app.model_idx = 0;
+            } else if let Some((p, m)) = app.parse_model_arg(arg) {
+                let items = model_entries(app, arg);
+                // Exact catalog hit, or unambiguous single match.
+                let hit = items.iter().find(|(ep, em, _)| ep == &p && em.eq_ignore_ascii_case(&m));
+                if let Some((ep, em, _)) = hit {
+                    let (ep, em) = (ep.clone(), em.clone());
+                    match app.apply_provider_model(&ep, &em) {
+                        Ok(_) => app.conversation.add_message("assistant".into(), format!("**Model set to:** `{}/{}`", ep, em)),
+                        Err(e) => app.conversation.add_message("assistant".into(), e),
+                    }
+                } else if items.len() == 1 {
+                    let (ep, em, _) = items[0].clone();
+                    match app.apply_provider_model(&ep, &em) {
+                        Ok(_) => app.conversation.add_message("assistant".into(), format!("**Model set to:** `{}/{}`", ep, em)),
+                        Err(e) => app.conversation.add_message("assistant".into(), e),
+                    }
+                } else if items.is_empty() {
+                    // Free-form `provider/model` (e.g. brand-new OpenRouter id).
+                    match app.apply_provider_model(&p, &m) {
+                        Ok(_) => app.conversation.add_message("assistant".into(), format!("**Model set to:** `{}/{}`\n_custom id — verify it exists on the provider._", p, m)),
+                        Err(e) => app.conversation.add_message("assistant".into(), e),
+                    }
+                } else {
+                    let mut out = format!("**{} matches** — refine or ↑↓ + Enter:\n", items.len());
+                    for (ep, em, ready) in items.iter().take(10) {
+                        out.push_str(&format!("- {} `{}/{}`\n", if *ready { "●" } else { "○" }, ep, em));
+                    }
+                    app.conversation.add_message("assistant".into(), out);
+                }
             } else {
-                app.current_model = arg.to_string();
-                app.status.model = app.current_model.clone();
-                app.conversation.add_message("assistant".into(), format!("**Model set to:** `{}`", app.current_model));
+                app.conversation.add_message("assistant".into(), "Usage: `/model <provider/model>`".into());
+            }
+            app.save_session();
+            app.is_home = false;
+            return Ok(true);
+        }
+        "/login" => {
+            if arg.is_empty() {
+                let mut out = String::from("**Providers:**\n");
+                for pid in app.config.all_provider_ids() {
+                    let (key, src) = crate::auth::resolve_api_key(&pid, &app.auth, &app.config);
+                    let rpc = app.config.resolve_provider_config(&pid);
+                    let mark = if key.is_empty() { "○" } else { "●" };
+                    let where_ = if key.is_empty() { "no key" } else { src };
+                    let base = if rpc.base_url.is_empty() { "(default endpoint)".into() } else { rpc.base_url.clone() };
+                    out.push_str(&format!("- {} `{}` — {} · {}\n", mark, pid, where_, base));
+                }
+                out.push_str("\n`●` ready · `○` needs key\nUsage: `/login <provider>` then paste the key (kept in `~/.barong/auth.json`, never in project files)");
+                app.conversation.add_message("assistant".into(), out);
+            } else {
+                let pid = arg.split_whitespace().next().unwrap_or("").to_lowercase();
+                let rpc = app.config.resolve_provider_config(&pid);
+                if !rpc.known {
+                    app.conversation.add_message("assistant".into(), format!("Unknown provider `{}`. Known: {}.\nCustom OpenAI-compatible endpoints go in `barong.jsonc` under `providers`.", pid, app.config.all_provider_ids().join(", ")));
+                } else {
+                    app.pending_login = Some(pid.clone());
+                    app.login_buffer.clear();
+                    app.notice = Some(format!("paste API key for '{}' — Enter saves, Esc cancels", pid));
+                }
+            }
+            app.save_session();
+            app.is_home = false;
+            return Ok(true);
+        }
+        "/logout" => {
+            if arg.is_empty() {
+                app.conversation.add_message("assistant".into(), "Usage: `/logout <provider>`".into());
+            } else {
+                let pid = arg.split_whitespace().next().unwrap_or("").to_lowercase();
+                if app.auth.remove(&pid) {
+                    let (_, src) = crate::auth::resolve_api_key(&app.provider_name, &app.auth, &app.config);
+                    app.key_source = src;
+                    app.conversation.add_message("assistant".into(), format!("Removed saved key for `{}`.", pid));
+                } else {
+                    app.conversation.add_message("assistant".into(), format!("No saved key for `{}` (auth.json). Env keys are managed outside barong.", pid));
+                }
             }
             app.save_session();
             app.is_home = false;

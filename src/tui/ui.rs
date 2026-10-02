@@ -27,8 +27,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         render_chat(frame, chunks[0], app);
     }
     render_input(frame, chunks[1], app);
-    // palette overlays above input
-    if app.input.buffer.starts_with('/') && app.event_rx.is_none() && app.pending_approval.is_none() {
+    // pickers overlay above input (model picker takes over command palette)
+    let model_mode = app.input.buffer.starts_with("/model ");
+    if model_mode && app.event_rx.is_none() && app.pending_approval.is_none() && app.pending_login.is_none() {
+        render_model_picker(frame, chunks[0], chunks[1], app);
+    } else if app.input.buffer.starts_with('/') && app.event_rx.is_none() && app.pending_approval.is_none() && app.pending_login.is_none() {
         render_palette(frame, chunks[0], chunks[1], app);
     }
     render_status(frame, chunks[2], app);
@@ -229,6 +232,17 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(t.muted)
         });
 
+    if let Some(pid) = &app.pending_login {
+        let masked = "•".repeat(app.login_buffer.chars().count().min(48));
+        let line = Line::from(vec![
+            Span::styled(format!("key for {}: ", pid), Style::default().fg(t.accent)),
+            Span::raw(masked),
+            Span::styled("█", Style::default().fg(t.accent).add_modifier(Modifier::SLOW_BLINK)),
+        ]);
+        frame.render_widget(Paragraph::new(line).block(block), area);
+        return;
+    }
+
     if busy {
         let label = if app.pending_approval.is_some() {
             " (y/a/n to decide)"
@@ -306,6 +320,50 @@ fn render_palette(frame: &mut Frame, chat: Rect, input: Rect, app: &App) {
     frame.render_widget(List::new(list_items).block(block), area);
 }
 
+fn render_model_picker(frame: &mut Frame, chat: Rect, input: Rect, app: &App) {
+    let filter = app.input.buffer["/model ".len()..].to_string();
+    let items = crate::tui::input::model_entries(app, &filter);
+    if items.is_empty() {
+        return;
+    }
+    let visible = items.len().min(8);
+    let selected = app.model_idx % items.len();
+    let max_start = items.len().saturating_sub(visible);
+    let start = (selected.saturating_sub(visible.saturating_sub(1))).min(max_start);
+    let end = (start + visible).min(items.len());
+    let height = (visible + 2) as u16;
+    let width = input.width.min(64);
+    let x = input.x;
+    let y = input.y.saturating_sub(height);
+    let area = Rect::new(x, y, width, height);
+    let _ = chat;
+    frame.render_widget(Clear, area);
+    let list_items: Vec<ListItem> = items[start..end]
+        .iter()
+        .enumerate()
+        .map(|(i, (p, m, ready))| {
+            let style = if start + i == selected {
+                Style::default().fg(Color::Black).bg(app.theme.accent)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let dot = if *ready { "●" } else { "○" };
+            let dot_color = if *ready { app.theme.success } else { app.theme.muted };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!(" {} ", dot), Style::default().fg(dot_color)),
+                Span::styled(format!("{:<10}", p), style),
+                Span::styled(format!(" {}", truncate(m, 34)), Style::default().fg(app.theme.muted)),
+            ]))
+        })
+        .collect();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .title(format!(" model {}/{} — ● key ready ", selected + 1, items.len()))
+        .border_style(Style::default().fg(app.theme.muted));
+    frame.render_widget(List::new(list_items).block(block), area);
+}
+
 fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     let t = &app.theme;
     let ctx = (app.context_usage() * 100.0) as u32;
@@ -313,7 +371,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     let mut parts = vec![
         Span::styled(format!(" {}", app.cwd_short()), Style::default().fg(t.muted)),
         Span::styled(" │ ", Style::default().fg(t.muted)),
-        Span::styled(format!("{}", app.current_model), Style::default().fg(t.accent)),
+        Span::styled(format!("{}/{}", app.provider_name, truncate(&app.current_model, 32)), Style::default().fg(t.accent)),
         Span::styled(" │ ", Style::default().fg(t.muted)),
         Span::styled(format!("msgs:{}", app.conversation.messages.len()), Style::default().fg(t.muted)),
         Span::styled(" │ ", Style::default().fg(t.muted)),

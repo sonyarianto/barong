@@ -1,5 +1,18 @@
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::Path;
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ProviderConfig {
+    /// API flavor: "openai" (default, chat completions) or "anthropic".
+    pub api: Option<String>,
+    pub base_url: Option<String>,
+    /// Discouraged: prefer `~/.barong/auth.json` (`/login`) or env.
+    /// Kept as last-resort fallback so old configs keep working.
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub models: Vec<String>,
+}
 
 #[derive(Debug, Default, Deserialize)]
 pub struct Config {
@@ -18,6 +31,11 @@ pub struct Config {
     pub extra_tools: Vec<String>,
     #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
+    /// Named providers (openrouter, deepseek, nvidia, ollama, ...).
+    /// Merged over built-in defaults below; e.g.
+    /// `"openrouter": {"base_url": "...", "models": ["x/y"]}`.
+    #[serde(default)]
+    pub providers: HashMap<String, ProviderConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -26,6 +44,14 @@ pub struct McpServerConfig {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedProvider {
+    pub api: String,
+    pub base_url: String,
+    pub models: Vec<String>,
+    pub known: bool,
 }
 
 impl Config {
@@ -60,8 +86,95 @@ impl Config {
     pub fn resolve_provider(&self) -> String {
         self.provider
             .clone()
-            .or_else(|| std::env::var("BARONG_PROVIDER").ok())
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var("BARONG_PROVIDER").ok().map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()))
             .unwrap_or_else(|| "openai".into())
+    }
+
+    /// Built-in provider defaults: (api flavor, base_url, models, env var, needs_key).
+    /// Covers OpenAI/Anthropic plus popular OpenAI-compatible endpoints
+    /// (OpenRouter, DeepSeek, NVIDIA, Ollama) so reseller/proxy tokens work.
+    pub fn known_provider(id: &str) -> Option<(&'static str, &'static str, &'static [&'static str], &'static str, bool)> {
+        match id.trim().to_lowercase().as_str() {
+            "openai" => Some(("openai", "https://api.openai.com/v1", &["gpt-4o", "gpt-4o-mini"], "OPENAI_API_KEY", true)),
+            "anthropic" => Some(("anthropic", "", &["claude-sonnet-4-20250514"], "ANTHROPIC_API_KEY", true)),
+            "openrouter" => Some(("openai", "https://openrouter.ai/api/v1",
+                &["openai/gpt-4o", "anthropic/claude-sonnet-4", "deepseek/deepseek-chat-v3-0324", "qwen/qwen3-coder", "google/gemini-2.5-pro", "meta-llama/llama-3.3-70b-instruct"],
+                "OPENROUTER_API_KEY", true)),
+            "deepseek" => Some(("openai", "https://api.deepseek.com/v1",
+                &["deepseek-chat", "deepseek-reasoner"], "DEEPSEEK_API_KEY", true)),
+            "nvidia" => Some(("openai", "https://integrate.api.nvidia.com/v1",
+                &["deepseek-ai/deepseek-r1", "meta/llama-3.1-70b-instruct", "nvidia/llama-3.1-nemotron-70b-instruct"],
+                "NVIDIA_API_KEY", true)),
+            "ollama" => Some(("openai", "http://localhost:11434/v1",
+                &["qwen2.5-coder:7b", "llama3.1:8b"], "", false)),
+            _ => None,
+        }
+    }
+
+    pub fn known_provider_ids() -> Vec<&'static str> {
+        vec!["openai", "anthropic", "openrouter", "deepseek", "nvidia", "ollama"]
+    }
+
+    /// All provider ids: built-ins plus user-defined in config.
+    pub fn all_provider_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = Self::known_provider_ids().iter().map(|s| s.to_string()).collect();
+        for k in self.providers.keys() {
+            let id = k.trim().to_lowercase();
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        ids.sort();
+        ids
+    }
+    /// Merge built-in defaults with user `providers` overrides.
+    pub fn resolve_provider_config(&self, id: &str) -> ResolvedProvider {
+        let id = id.trim().to_lowercase();
+        let known = Self::known_provider(&id);
+        let mut api = known.map(|k| k.0.to_string()).unwrap_or_else(|| "openai".into());
+        let mut base_url = known.map(|k| k.1.to_string()).unwrap_or_default();
+        let mut models: Vec<String> = known.map(|k| k.2.iter().map(|s| s.to_string()).collect()).unwrap_or_default();
+        if let Some(o) = self.providers.get(&id) {
+            if let Some(a) = &o.api {
+                if !a.trim().is_empty() {
+                    api = a.trim().to_lowercase();
+                }
+            }
+            if let Some(u) = &o.base_url {
+                if !u.trim().is_empty() {
+                    base_url = u.trim().to_string();
+                }
+            }
+            if !o.models.is_empty() {
+                models = o.models.clone();
+            }
+        }
+        // Legacy top-level base_url applies to the default provider.
+        if id == self.resolve_provider() {
+            if let Some(u) = &self.base_url {
+                if !u.trim().is_empty() {
+                    base_url = u.trim().to_string();
+                }
+            }
+        }
+        ResolvedProvider { api, base_url, models, known: known.is_some() || self.providers.contains_key(&id) }
+    }
+
+    /// Default model for a provider: config `model` (if default provider),
+    /// else first known model, else "gpt-4o".
+    pub fn resolve_default_model(&self, provider_id: &str) -> String {
+        let id = provider_id.trim().to_lowercase();
+        if id == self.resolve_provider() {
+            if let Some(m) = &self.model {
+                if !m.trim().is_empty() {
+                    return m.trim().to_string();
+                }
+            }
+        }
+        let cfg = self.resolve_provider_config(&id);
+        cfg.models.into_iter().next().unwrap_or_else(|| "gpt-4o".into())
     }
 
     pub fn resolve_model(&self, provider: &str) -> String {
@@ -192,6 +305,36 @@ mod tests {
         let extras = cfg.resolve_extra_tools();
         assert!(extras.contains(&"grep".to_string()));
         std::env::remove_var("BARONG_EXTRA_TOOLS");
+    }
+
+    #[test]
+    fn test_provider_registry() {
+        let cfg = Config::default();
+        // Built-in reseller endpoints.
+        let o = cfg.resolve_provider_config("openrouter");
+        assert_eq!(o.base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(o.api, "openai");
+        assert!(o.models.iter().any(|m| m.contains("deepseek")));
+        let d = cfg.resolve_provider_config("deepseek");
+        assert!(d.models.contains(&"deepseek-chat".to_string()));
+        let n = cfg.resolve_provider_config("nvidia");
+        assert_eq!(n.base_url, "https://integrate.api.nvidia.com/v1");
+        // Unknown provider: openai-flavored, empty base/models.
+        let x = cfg.resolve_provider_config("acme");
+        assert!(!x.known);
+        assert_eq!(cfg.resolve_default_model("deepseek"), "deepseek-chat");
+        // User override merges over built-in.
+        let mut custom = Config::default();
+        custom.providers.insert("deepseek".into(), ProviderConfig {
+            api: None,
+            base_url: Some("https://proxy.local/v1".into()),
+            api_key: None,
+            models: vec!["custom-r1".into()],
+        });
+        let c = custom.resolve_provider_config("deepseek");
+        assert_eq!(c.base_url, "https://proxy.local/v1");
+        assert_eq!(c.models, vec!["custom-r1".to_string()]);
+        assert!(custom.all_provider_ids().contains(&"deepseek".to_string()));
     }
 }
 

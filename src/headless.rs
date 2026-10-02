@@ -16,6 +16,9 @@ use tokio::sync::mpsc;
 pub struct HeadlessCtx {
     pub config: Config,
     pub provider_kind: ProviderKind,
+    pub provider_name: String,
+    pub base_url: String,
+    pub api_key: String,
     pub model: String,
     pub tool_registry: Arc<ToolRegistry>,
     // keep MCP servers alive for the run
@@ -45,9 +48,43 @@ pub fn build_ctx(cli: &Cli) -> Result<HeadlessCtx> {
         config.extra_tools = base;
     }
 
-    let provider_str = config.resolve_provider();
-    let provider_kind = ProviderKind::from_str(&provider_str);
-    let model = config.resolve_model(&provider_str);
+    let mut provider_name = cli
+        .provider
+        .as_deref()
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| config.resolve_provider());
+    let mut model = config.resolve_default_model(&provider_name);
+    if let Some(m) = &cli.model {
+        let t = m.trim();
+        if !t.is_empty() {
+            if let Some(i) = t.find('/') {
+                let p = t[..i].trim().to_lowercase();
+                let mm = t[i + 1..].trim();
+                if !p.is_empty() && !mm.is_empty() {
+                    provider_name = p;
+                    model = mm.to_string();
+                }
+            } else {
+                model = t.to_string();
+            }
+        }
+    } else if provider_name == config.resolve_provider() {
+        if let Some(m) = &config.model {
+            if !m.trim().is_empty() {
+                model = m.trim().to_string();
+            }
+        }
+    }
+    let rpc = config.resolve_provider_config(&provider_name);
+    let provider_kind = ProviderKind::from_str(&rpc.api);
+    let base_url = if rpc.base_url.is_empty() {
+        config.resolve_base_url()
+    } else {
+        rpc.base_url.clone()
+    };
+    let auth = crate::auth::AuthStore::new();
+    let (api_key, _) = crate::auth::resolve_api_key(&provider_name, &auth, &config);
     let extras = config.resolve_extra_tools();
 
     let mut registry = ToolRegistry::new().with_extras(&extras);
@@ -56,9 +93,9 @@ pub fn build_ctx(cli: &Cli) -> Result<HeadlessCtx> {
         e.eq_ignore_ascii_case("delegate") || e.eq_ignore_ascii_case("all")
     }) {
         registry.register_delegate(
-            config.resolve_api_key(&provider_str),
-            config.resolve_model(&provider_str),
-            config.resolve_base_url(),
+            api_key.clone(),
+            model.clone(),
+            base_url.clone(),
             provider_kind,
         );
     }
@@ -98,6 +135,9 @@ pub fn build_ctx(cli: &Cli) -> Result<HeadlessCtx> {
     Ok(HeadlessCtx {
         config,
         provider_kind,
+        provider_name,
+        base_url,
+        api_key,
         model,
         tool_registry: Arc::new(registry),
         _mcp_servers: mcp_servers,
@@ -112,14 +152,15 @@ fn permission_gate(ctx: &HeadlessCtx, cli: &Cli) -> PermissionGate {
     PermissionGate::new(auto)
 }
 
-fn make_provider(ctx: &HeadlessCtx) -> Box<dyn LLMProvider> {    match ctx.provider_kind {
+fn make_provider(ctx: &HeadlessCtx) -> Box<dyn LLMProvider> {
+    match ctx.provider_kind {
         ProviderKind::OpenAI => Box::new(OpenAIProvider::new(
-            ctx.config.resolve_api_key("openai"),
+            ctx.api_key.clone(),
             ctx.model.clone(),
-            ctx.config.resolve_base_url(),
+            ctx.base_url.clone(),
         )),
         ProviderKind::Anthropic => Box::new(AnthropicProvider::new(
-            ctx.config.resolve_api_key("anthropic"),
+            ctx.api_key.clone(),
             ctx.model.clone(),
             ctx.config.resolve_max_tokens(),
         )),
@@ -133,9 +174,23 @@ fn base_messages(ctx: &HeadlessCtx, prompt: &str) -> Vec<crate::agent::conversat
     conv.full_context()
 }
 
+fn require_key(ctx: &HeadlessCtx) -> Result<()> {
+    if ctx.api_key.is_empty() {
+        let env = format!("{}_API_KEY", ctx.provider_name.to_uppercase().replace('-', "_"));
+        anyhow::bail!(
+            "no API key for provider '{}'. Set {} (or BARONG_API_KEY), add it to ~/.barong/auth.json via `/login {}`, or use --provider/--model for another endpoint.",
+            ctx.provider_name,
+            env,
+            ctx.provider_name
+        );
+    }
+    Ok(())
+}
+
 /// Print mode: run agent, output final assistant text only.
 pub async fn run_print(prompt: &str, cli: &Cli) -> Result<()> {
     let ctx = build_ctx(cli)?;
+    require_key(&ctx)?;
     let provider = make_provider(&ctx);
     let messages = base_messages(&ctx, prompt);
     let tools = ctx.tool_registry.definitions();
@@ -194,6 +249,7 @@ pub async fn run_print(prompt: &str, cli: &Cli) -> Result<()> {
 pub async fn run_json(prompt: &str, cli: &Cli) -> Result<()> {
     use serde_json::json;
     let ctx = build_ctx(cli)?;
+    require_key(&ctx)?;
     let provider = make_provider(&ctx);
     let messages = base_messages(&ctx, prompt);
     let tools = ctx.tool_registry.definitions();
@@ -311,6 +367,10 @@ pub async fn run_rpc(cli: &Cli) -> Result<()> {
                 let text = req.get("text").and_then(|v| v.as_str()).unwrap_or("");
                 if text.is_empty() {
                     println!("{}", json!({"type":"error","error":"missing text"}));
+                    continue;
+                }
+                if let Err(e) = require_key(&ctx) {
+                    println!("{}", json!({"type":"error","error": e.to_string()}));
                     continue;
                 }
                 let provider = make_provider(&ctx);
