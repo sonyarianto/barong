@@ -1253,25 +1253,37 @@ mod tests {
         assert_eq!(app.provider_name, "openai");
         handle_slash(&mut app, "/model nvidia").unwrap();
         assert_eq!(app.provider_name, "nvidia", "bare provider id must switch provider");
-        assert_eq!(app.current_model, "deepseek-ai/deepseek-r1");
+        assert_eq!(app.current_model, "openai/gpt-oss-20b");
     }
 
     #[test]
     fn model_full_id_switches_provider() {
         let mut app = test_app();
         app.auth.set("nvidia", "nvapi-test-key");
-        handle_slash(&mut app, "/model nvidia/deepseek-ai/deepseek-r1").unwrap();
+        handle_slash(&mut app, "/model nvidia/openai/gpt-oss-20b").unwrap();
         assert_eq!(app.provider_name, "nvidia");
-        assert_eq!(app.current_model, "deepseek-ai/deepseek-r1");
+        assert_eq!(app.current_model, "openai/gpt-oss-20b");
+    }
+
+    #[test]
+    fn model_freeform_future_id_applies_with_warning() {
+        // IDs released after this catalog still work via free-form.
+        let mut app = test_app();
+        app.auth.set("nvidia", "nvapi-test-key");
+        handle_slash(&mut app, "/model nvidia/some-future-model-xyz").unwrap();
+        assert_eq!(app.provider_name, "nvidia");
+        assert_eq!(app.current_model, "some-future-model-xyz");
+        let last = app.conversation.messages.last().and_then(|m| m.content.clone()).unwrap_or_default();
+        assert!(last.contains("Model set to"), "got: {}", last);
     }
 
     #[test]
     fn model_unprefixed_known_id_switches_provider() {
         let mut app = test_app();
-        app.auth.set("nvidia", "nvapi-test-key");
-        handle_slash(&mut app, "/model deepseek-ai/deepseek-r1").unwrap();
-        assert_eq!(app.provider_name, "nvidia");
-        assert_eq!(app.current_model, "deepseek-ai/deepseek-r1");
+        app.auth.set("deepseek", "sk-test-key");
+        handle_slash(&mut app, "/model deepseek-reasoner").unwrap();
+        assert_eq!(app.provider_name, "deepseek");
+        assert_eq!(app.current_model, "deepseek-reasoner");
     }
 
     #[test]
@@ -1307,7 +1319,7 @@ mod tests {
         handle_slash(&mut app, "/model nvidia").unwrap();
         assert_eq!(app.status.llm_provider, "openai"); // nvidia speaks OpenAI API
         let ep = app.endpoint.lock().unwrap();
-        assert_eq!(ep.model, "deepseek-ai/deepseek-r1");
+        assert_eq!(ep.model, "openai/gpt-oss-20b");
         assert_eq!(ep.api_key, "nvapi-test-key");
         assert_eq!(ep.base_url, "https://integrate.api.nvidia.com/v1");
     }
@@ -1328,9 +1340,9 @@ mod tests {
         assert_eq!(app.auth.get("nvidia").as_deref(), Some("nvapi-test-key"));
         // No separate `/model` step needed: session follows the login.
         assert_eq!(app.provider_name, "nvidia");
-        assert_eq!(app.current_model, "deepseek-ai/deepseek-r1");
+        assert_eq!(app.current_model, "openai/gpt-oss-20b");
         let last = app.conversation.messages.last().and_then(|m| m.content.clone()).unwrap_or_default();
-        assert!(last.contains("Switched to `nvidia/deepseek-ai/deepseek-r1`"), "got: {}", last);
+        assert!(last.contains("Switched to `nvidia/openai/gpt-oss-20b`"), "got: {}", last);
     }
 
     #[test]
@@ -1405,7 +1417,7 @@ mod tests {
         app.auth.set("nvidia", "nvapi-test-key");
         handle_slash(&mut app, "/models nvidia").unwrap();
         assert_eq!(app.provider_name, "nvidia");
-        assert_eq!(app.current_model, "deepseek-ai/deepseek-r1");
+        assert_eq!(app.current_model, "openai/gpt-oss-20b");
     }
 
     #[test]

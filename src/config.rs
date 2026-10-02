@@ -105,7 +105,10 @@ impl Config {
             "deepseek" => Some(("openai", "https://api.deepseek.com/v1",
                 &["deepseek-chat", "deepseek-reasoner"], "DEEPSEEK_API_KEY", true)),
             "nvidia" => Some(("openai", "https://integrate.api.nvidia.com/v1",
-                &["deepseek-ai/deepseek-r1", "meta/llama-3.1-70b-instruct", "nvidia/llama-3.1-nemotron-70b-instruct"],
+                // Verified live 2026-10-02 with dummy-key probe (403 = exists,
+                // 404/410 = dead). Catalogs rot — re-probe on doubt; users can
+                // always type any `nvidia/<id>` free-form via `/model`.
+                &["openai/gpt-oss-20b", "nvidia/llama-3.1-nemotron-70b-instruct"],
                 "NVIDIA_API_KEY", true)),
             "ollama" => Some(("openai", "http://localhost:11434/v1",
                 &["qwen2.5-coder:7b", "llama3.1:8b"], "", false)),
