@@ -79,6 +79,9 @@ impl MarkdownRenderer {
                     code_block_lang = raw_line.trim_start().trim_start_matches("```").trim().to_string();
                     let lang = if code_block_lang.is_empty() { "code".to_string() } else { code_block_lang.clone() };
                     lines.push(self.code_label(&prefix, &lang));
+                    if let Some(gap) = self.code_gap(&prefix) {
+                        lines.push(gap);
+                    }
                 }
                 continue;
             }
@@ -158,6 +161,8 @@ impl MarkdownRenderer {
 
     /// Container label row: dim language tag on panel background.
     /// Falls back to the compact header when the width is unknown (< 20).
+    /// The bar is `▎` (left-quarter block): unlike `┃` it hugs the left edge
+    /// of its cell in most fonts instead of floating right.
     fn code_label<'a>(&self, prefix: &Span<'a>, lang: &str) -> Line<'a> {
         let inner = self.width.saturating_sub(prefix.width() as u16) as usize;
         if inner < 20 {
@@ -171,10 +176,24 @@ impl MarkdownRenderer {
         let pad = inner.saturating_sub(2 + lang.chars().count());
         Line::from(vec![
             prefix.clone(),
-            Span::styled("┃ ", Style::default().fg(self.muted).bg(self.panel)),
+            Span::styled("▎ ", Style::default().fg(self.muted).bg(self.panel)),
             Span::styled(lang.to_string(), Style::default().fg(self.muted).bg(self.panel)),
             Span::styled(" ".repeat(pad), Style::default().bg(self.panel)),
         ])
+    }
+
+    /// Blank breathing row between label and body (panel bg, bar continues).
+    /// Empty vec when narrow (compact path has no container to breathe in).
+    fn code_gap<'a>(&self, prefix: &Span<'a>) -> Option<Line<'a>> {
+        let inner = self.width.saturating_sub(prefix.width() as u16) as usize;
+        if inner < 20 {
+            return None;
+        }
+        Some(Line::from(vec![
+            prefix.clone(),
+            Span::styled("▎ ", Style::default().fg(self.muted).bg(self.panel)),
+            Span::styled(" ".repeat(inner.saturating_sub(2)), Style::default().bg(self.panel)),
+        ]))
     }
 
     fn emit_code_block<'a>(&self, lines: &mut Vec<Line<'a>>, prefix: &Span<'a>, lang: &str, code_lines: &[String]) {
@@ -219,7 +238,7 @@ impl MarkdownRenderer {
                 let w: usize = seg.iter().map(|(_, t)| display_width(t)).sum();
                 let mut line_spans = vec![
                     prefix.clone(),
-                    Span::styled("┃ ", Style::default().fg(self.muted).bg(self.panel)),
+                    Span::styled("▎ ", Style::default().fg(self.muted).bg(self.panel)),
                     Span::styled(gutter, Style::default().fg(self.muted).bg(self.panel)),
                 ];
                 for (style, text) in seg {
@@ -568,16 +587,17 @@ mod tests {
         let long = "x".repeat(100);
         let text = format!("```go\n{}\n```", long);
         let out = md.render(&text, "assistant");
-        // label + wrapped body; every row exactly 40 cells.
-        assert!(out.len() > 2, "must wrap, got {} rows", out.len());
+        // label + gap + wrapped body; every row exactly 40 cells.
+        assert!(out.len() > 3, "must wrap, got {} rows", out.len());
         for (i, l) in out.iter().enumerate() {
             let s: String = l.spans.iter().map(|s| s.content.to_string()).collect();
             assert_eq!(s.width(), 40, "row {} width, got: {}", i, s);
         }
         assert!(out[0].spans.iter().any(|s| s.content.contains("go")));
         // First body row keeps the gutter number, continuations don't.
-        assert!(out[1].spans.iter().any(|s| s.content.contains('1')));
-        assert!(out[2].spans.iter().all(|s| !s.content.contains('2') || s.content.contains('x')));
+        // (index 0 = label, 1 = gap.)
+        assert!(out[2].spans.iter().any(|s| s.content.contains('1')));
+        assert!(out[3].spans.iter().all(|s| !s.content.contains('2') || s.content.contains('x')));
     }
 
     #[test]
@@ -643,15 +663,17 @@ mod tests {
     fn wide_container_rows_span_full_width() {
         let md = MarkdownRenderer::new().with_width(60);
         let out = flat(&md.render("```go\nx\n```", "assistant"));
-        // label row + 1 code row, no rules anywhere.
-        assert_eq!(out.len(), 2, "label + 1 code, got: {:?}", out);
+        // label + breathing gap + 1 code row, no rules anywhere.
+        assert_eq!(out.len(), 3, "label + gap + 1 code, got: {:?}", out);
         assert!(out[0].contains("go"), "label, got: {}", out[0]);
         assert!(!out[0].contains('╭') && !out[0].contains('─'), "no rules, got: {}", out[0]);
         for (i, l) in out.iter().enumerate() {
             use unicode_width::UnicodeWidthStr;
             assert_eq!(l.width(), 60, "row {} full width, got: {}", i, l);
-            assert!(l.starts_with("┃ "), "left bar, got: {}", l);
+            assert!(l.starts_with("▎ "), "left-hugging bar, got: {}", l);
         }
-        assert!(out[1].contains('1'), "gutter, got: {}", out[1]);
+        // Gap row carries no content.
+        assert!(out[1].trim_start_matches(['▎', ' ']).is_empty(), "gap, got: {}", out[1]);
+        assert!(out[2].contains('1'), "gutter, got: {}", out[2]);
     }
 }
