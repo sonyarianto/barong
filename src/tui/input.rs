@@ -838,18 +838,9 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
             return Ok(true);
         }
         "/model" => {
-            if arg.is_empty() {
-                let mut out = format!(
-                    "**Provider:** `{}`\n**Model:** `{}`\n**Key:** {} ({})\n\n**Ready models:**\n",
-                    app.provider_name, app.current_model, if app.api_key().is_empty() { "missing" } else { "set" }, app.key_source,
-                );
-                for (p, m, ready) in model_entries(app, "").iter().take(12) {
-                    out.push_str(&format!("- {} `{}`\n", if *ready { "●" } else { "○" }, model_label(p, m)));
-                }
-                out.push_str("\nUsage: `/model <provider/model>` or `/model <text>` + ↑↓ + Enter\n`○` = no key yet — `/login <provider>`");
-                app.conversation.add_message("assistant".into(), out);
-            } else if app.model_navigated {
-                // Enter after arrow-key navigation: use highlighted picker entry.
+            if arg.is_empty() || app.model_navigated {
+                // Picker was open: Enter confirms the highlighted entry.
+                // (On open it's preselected to the active model; arrows move it.)
                 let items = model_entries(app, arg);
                 if items.is_empty() {
                     app.conversation.add_message("assistant".into(), "No matching models.".into());
@@ -1045,10 +1036,13 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
         }
         "/session" => {
             let info = format!(
-                "**Session:** `{}`\n- msgs: {}\n- model: `{}`\n- cwd: `{}`\n- ctx: ~{}%\n- auto-compact: {} (keep={})\n- theme: `{}`\n- tree: {}",
+                "**Session:** `{}`\n- provider: `{}`\n- model: `{}`\n- key: {} ({})\n- msgs: {}\n- cwd: `{}`\n- ctx: ~{}%\n- auto-compact: {} (keep={})\n- theme: `{}`\n- tree: {}",
                 app.session_id.as_deref().unwrap_or("(unsaved)"),
-                app.conversation.messages.len(),
+                app.provider_name,
                 app.current_model,
+                if app.api_key().is_empty() { "missing" } else { "set" },
+                app.key_source,
+                app.conversation.messages.len(),
                 app.workspace.root.display(),
                 (app.context_usage() * 100.0) as u32,
                 app.config.resolve_auto_compact(),
@@ -1357,6 +1351,15 @@ mod tests {
         let live = model_entries(&app, "live/custom");
         assert_eq!(live.len(), 1);
         assert_eq!(live[0], ("nvidia".to_string(), "live/custom-1".to_string(), false));
+    }
+
+    #[test]
+    fn model_empty_arg_confirms_highlight() {
+        let mut app = test_app();
+        // Picker open, no navigation: highlight is items[0].
+        handle_slash(&mut app, "/model ").unwrap();
+        assert_eq!(app.provider_name, "ollama"); // keyless local is ready first
+        assert_eq!(app.current_model, "llama3.1:8b");
     }
 
     #[test]
