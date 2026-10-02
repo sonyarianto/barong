@@ -19,10 +19,13 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     render_chat(frame, chunks[0], app);
     render_input(frame, chunks[1], app);
     // palette overlays above input
-    if app.input.buffer.starts_with('/') && app.event_rx.is_none() {
+    if app.input.buffer.starts_with('/') && app.event_rx.is_none() && app.pending_approval.is_none() {
         render_palette(frame, chunks[0], chunks[1], app);
     }
     render_status(frame, chunks[2], app);
+    if app.pending_approval.is_some() {
+        render_permission_modal(frame, area, app);
+    }
 }
 
 fn render_chat(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -208,18 +211,25 @@ fn render_palette(frame: &mut Frame, chat: Rect, input: Rect, app: &App) {
     if items.is_empty() {
         return;
     }
-    let height = (items.len().min(8) + 2).min(12) as u16;
+    // Scrolling window so selected item is always visible.
+    let visible = items.len().min(8);
+    let selected = app.palette_idx % items.len();
+    // Keep selected inside window: pin start so window contains selected.
+    let max_start = items.len().saturating_sub(visible);
+    let start = (selected.saturating_sub(visible.saturating_sub(1))).min(max_start);
+    let end = (start + visible).min(items.len());
+    let height = (visible + 2) as u16;
     let width = input.width.min(60);
     let x = input.x;
     let y = input.y.saturating_sub(height);
     let area = Rect::new(x, y, width, height);
     let _ = chat;
     frame.render_widget(Clear, area);
-    let list_items: Vec<ListItem> = items
+    let list_items: Vec<ListItem> = items[start..end]
         .iter()
         .enumerate()
         .map(|(i, (name, desc))| {
-            let style = if i == app.palette_idx % items.len() {
+            let style = if start + i == selected {
                 Style::default().fg(Color::Black).bg(Color::Cyan)
             } else {
                 Style::default().fg(Color::White)
@@ -230,9 +240,15 @@ fn render_palette(frame: &mut Frame, chat: Rect, input: Rect, app: &App) {
             ]))
         })
         .collect();
+    let title = if items.len() > visible {
+        format!(" {}/{} ", selected + 1, items.len())
+    } else {
+        String::new()
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(ratatui::widgets::BorderType::Rounded)
+        .title(title)
         .border_style(Style::default().fg(Color::DarkGray));
     frame.render_widget(List::new(list_items).block(block), area);
 }
@@ -266,4 +282,38 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     }
     let p = Paragraph::new(Line::from(parts));
     frame.render_widget(p, area);
+}
+
+fn render_permission_modal(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(p) = &app.pending_approval else { return };
+    let width = area.width.min(76);
+    let height = 9u16;
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let modal = Rect::new(x, y, width, height);
+    frame.render_widget(Clear, modal);
+    let args_str = serde_json::to_string(&p.args).unwrap_or_default();
+    let args_short = truncate(&args_str, 120);
+    let lines = vec![
+        Line::from(Span::styled(
+            format!(" Allow `{}` ?", p.name),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(args_short, Style::default().fg(Color::DarkGray))),
+        Line::from(Span::raw("")),
+        Line::from(vec![
+            Span::styled(" [y] once ", Style::default().fg(Color::Black).bg(Color::Green)),
+            Span::raw(" "),
+            Span::styled(" [a] always this session ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+            Span::raw(" "),
+            Span::styled(" [n] deny ", Style::default().fg(Color::Black).bg(Color::Red)),
+        ]),
+        Line::from(Span::styled(" Esc = deny", Style::default().fg(Color::DarkGray))),
+    ];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .title(" permission ")
+        .border_style(Style::default().fg(Color::Yellow));
+    frame.render_widget(Paragraph::new(lines).block(block), modal);
 }

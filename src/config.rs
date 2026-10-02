@@ -9,6 +9,9 @@ pub struct Config {
     pub base_url: Option<String>,
     pub max_tokens: Option<u32>,
     pub theme: Option<String>,
+    pub auto_approve: Option<bool>,
+    pub auto_compact: Option<bool>,
+    pub compact_keep: Option<usize>,
     /// Opt-in extras beyond core (read/write/edit/bash).
     /// e.g. ["grep", "glob", "delegate", "all"]
     #[serde(default)]
@@ -101,6 +104,41 @@ impl Config {
 
     pub fn resolve_max_tokens(&self) -> u32 {
         self.max_tokens.unwrap_or(4096)
+    }
+
+    pub fn resolve_auto_approve(&self) -> bool {
+        if let Some(v) = self.auto_approve {
+            return v;
+        }
+        if let Ok(raw) = std::env::var("BARONG_AUTO_APPROVE") {
+            let t = raw.trim().to_lowercase();
+            return matches!(t.as_str(), "1" | "true" | "yes" | "y" | "on");
+        }
+        // Safe default: ask for mutating tools.
+        false
+    }
+
+    pub fn resolve_auto_compact(&self) -> bool {
+        if let Some(v) = self.auto_compact {
+            return v;
+        }
+        if let Ok(raw) = std::env::var("BARONG_AUTO_COMPACT") {
+            let t = raw.trim().to_lowercase();
+            return !matches!(t.as_str(), "0" | "false" | "no" | "n" | "off");
+        }
+        true
+    }
+
+    pub fn resolve_compact_keep(&self) -> usize {
+        if let Some(v) = self.compact_keep {
+            return v.clamp(5, 100);
+        }
+        if let Ok(raw) = std::env::var("BARONG_COMPACT_KEEP") {
+            if let Ok(v) = raw.trim().parse::<usize>() {
+                return v.clamp(5, 100);
+            }
+        }
+        20
     }
 
     pub fn resolve_extra_tools(&self) -> Vec<String> {

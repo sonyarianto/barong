@@ -22,6 +22,15 @@ pub enum StreamEvent {
         name: String,
         result: serde_json::Value,
     },
+    PermissionRequest {
+        id: String,
+        name: String,
+        args: serde_json::Value,
+    },
+    PermissionResult {
+        id: String,
+        approved: bool,
+    },
     Usage {
         input_tokens: u64,
         output_tokens: u64,

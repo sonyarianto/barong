@@ -53,22 +53,25 @@ async fn main() -> Result<()> {
         cli::Mode::Interactive => {
             // If a positional prompt was given with explicit interactive mode,
             // boot TUI with it pre-sent is out of scope for MVP; just run TUI.
-            run_tui().await
+            run_tui(cli.yes).await
         }
     }
 }
 
-async fn run_tui() -> Result<()> {
+async fn run_tui(auto_approve: bool) -> Result<()> {
     // ratatui is sync; run it on blocking thread scope via existing loop.
     // We are already inside tokio runtime, App::start_agent spawns tasks onto it.
     let terminal = ratatui::init();
-    let result = run_blocking(terminal);
+    let result = run_blocking(terminal, auto_approve);
     ratatui::restore();
     result
 }
 
-fn run_blocking(mut terminal: DefaultTerminal) -> Result<()> {
+fn run_blocking(mut terminal: DefaultTerminal, auto_approve: bool) -> Result<()> {
     let mut app = app::App::new();
+    if auto_approve {
+        app.permission_gate.set_auto_approve(true);
+    }
     while !app.should_quit {
         terminal.draw(|frame| app.render(frame))?;
         app.handle_stream()?;

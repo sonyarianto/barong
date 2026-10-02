@@ -45,6 +45,10 @@ pub struct Cli {
     /// Max agent iterations (default 25)
     #[arg(long = "max-iterations")]
     pub max_iterations: Option<u32>,
+
+    /// Auto-approve mutating tools (write/edit/bash). Same as BARONG_AUTO_APPROVE=1.
+    #[arg(long = "yes", short = 'y')]
+    pub yes: bool,
 }
 
 impl Cli {

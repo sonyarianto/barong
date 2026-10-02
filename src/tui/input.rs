@@ -85,15 +85,38 @@ pub fn all_commands() -> Vec<(&'static str, &'static str)> {
         ("/session", "show current session info"),
         ("/export", "export session — /export [path]"),
         ("/copy", "copy last assistant message"),
-        ("/compact", "compact context — /compact [keep=10]"),
+        ("/compact", "compact context — /compact [keep=20] | /compact auto on|off"),
         ("/clear", "clear screen (same as /new)"),
         ("/model", "show or set model — /model [name]"),
         ("/tools", "list available tools"),
+        ("/allow", "allow tool — /allow <tool|all>"),
+        ("/approve", "auto-approve mode — /approve on|off"),
         ("/reload", "reload workspace context"),
         ("/hotkeys", "show keyboard shortcuts"),
         ("/help", "show this help"),
         ("/quit", "quit"),
     ]
+}
+
+fn handle_permission_key(app: &mut App, code: crossterm::event::KeyCode) -> Result<()> {
+    use crate::agent::permissions::Decision;
+    use crossterm::event::KeyCode;
+    match code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            app.approve_pending(Decision::AllowOnce);
+        }
+        KeyCode::Char('a') | KeyCode::Char('A') => {
+            app.approve_pending(Decision::AllowSession);
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            // Esc during approval denies (does not cancel whole agent).
+            app.approve_pending(Decision::Deny);
+        }
+        _ => {
+            app.notice = Some("y=allow once · a=always · n=deny".into());
+        }
+    }
+    return Ok(());
 }
 
 pub fn command_palette(filter: &str) -> Vec<(&'static str, &'static str)> {
@@ -261,6 +284,10 @@ pub fn handle_events(app: &mut App) -> Result<()> {
     if let Event::Key(key) = event::read()? {
         if key.kind != KeyEventKind::Press {
             return Ok(());
+        }
+        // Permission modal takes over all keys while pending.
+        if app.pending_approval.is_some() {
+            return handle_permission_key(app, key.code);
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -527,14 +554,55 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
             app.is_home = false;
             return Ok(true);
         }
+        "/allow" => {
+            if arg.is_empty() {
+                let allowed: Vec<String> = ["write", "edit", "bash", "delegate"]
+                    .iter()
+                    .filter(|t| app.permission_gate.is_session_allowed(t))
+                    .map(|s| s.to_string())
+                    .collect();
+                let auto = app.permission_gate.auto_approve();
+                app.conversation.add_message("assistant".into(), format!("**Permissions:** auto_approve={}\nsession-allowed: {}\nUsage: `/allow <write|edit|bash|delegate|all>`", auto, if allowed.is_empty() { "(none)".into() } else { allowed.join(", ") }));
+            } else {
+                let targets: Vec<String> = if arg.eq_ignore_ascii_case("all") {
+                    vec!["write".into(), "edit".into(), "bash".into(), "delegate".into()]
+                } else {
+                    vec![arg.to_string()]
+                };
+                for t in targets {
+                    app.permission_gate.allow_session(&t);
+                }
+                app.conversation.add_message("assistant".into(), format!("Allowed `{}` for this session.", arg));
+            }
+            app.save_session();
+            app.is_home = false;
+            return Ok(true);
+        }
+        "/approve" => {
+            if arg.eq_ignore_ascii_case("on") || arg == "1" || arg.eq_ignore_ascii_case("yes") {
+                app.permission_gate.set_auto_approve(true);
+                app.conversation.add_message("assistant".into(), "Auto-approve **on** — mutating tools run without asking.".into());
+            } else if arg.eq_ignore_ascii_case("off") || arg == "0" || arg.eq_ignore_ascii_case("no") {
+                app.permission_gate.set_auto_approve(false);
+                app.conversation.add_message("assistant".into(), "Auto-approve **off** — will ask for write/edit/bash.".into());
+            } else {
+                let auto = app.permission_gate.auto_approve();
+                app.conversation.add_message("assistant".into(), format!("**Auto-approve:** `{}`\nUsage: `/approve on|off`", auto));
+            }
+            app.save_session();
+            app.is_home = false;
+            return Ok(true);
+        }
         "/session" => {
             let info = format!(
-                "**Session:** `{}`\n- msgs: {}\n- model: `{}`\n- cwd: `{}`\n- ctx: ~{}%",
+                "**Session:** `{}`\n- msgs: {}\n- model: `{}`\n- cwd: `{}`\n- ctx: ~{}%\n- auto-compact: {} (keep={})",
                 app.session_id.as_deref().unwrap_or("(unsaved)"),
                 app.conversation.messages.len(),
                 app.current_model,
                 app.workspace.root.display(),
                 (app.context_usage() * 100.0) as u32,
+                app.config.resolve_auto_compact(),
+                app.config.resolve_compact_keep(),
             );
             app.conversation.add_message("assistant".into(), info);
             app.save_session();
@@ -598,20 +666,27 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
             return Ok(true);
         }
         "/compact" => {
-            let keep: usize = arg.split_whitespace().next().and_then(|s| s.parse().ok()).unwrap_or(10);
-            let n = app.conversation.messages.len();
-            if n > keep {
-                let drop = n - keep;
-                app.conversation.messages.drain(..drop);
-                app.conversation.messages.insert(0, crate::agent::conversation::Message {
-                    role: "assistant".into(),
-                    content: Some(format!("[Compacted {} older messages — AGENTS.md + recent {} kept]", drop, keep)),
-                    tool_calls: None,
-                    tool_call_id: None,
-                });
-                app.conversation.add_message("assistant".into(), format!("Compacted: dropped {} messages, kept {}", drop, keep));
+            let mut parts = arg.split_whitespace();
+            let first = parts.next().unwrap_or("");
+            if first.eq_ignore_ascii_case("auto") {
+                let mode = parts.next().unwrap_or("").to_lowercase();
+                if ["on", "1", "yes", "true"].contains(&mode.as_str()) {
+                    app.config.auto_compact = Some(true);
+                    app.conversation.add_message("assistant".into(), "Auto-compact **on** (triggers at ctx ≥85% or >100 msgs).".into());
+                } else if ["off", "0", "no", "false"].contains(&mode.as_str()) {
+                    app.config.auto_compact = Some(false);
+                    app.conversation.add_message("assistant".into(), "Auto-compact **off**.".into());
+                } else {
+                    let on = app.config.resolve_auto_compact();
+                    let keep = app.config.resolve_compact_keep();
+                    app.conversation.add_message("assistant".into(), format!("**Auto-compact:** `{}` (keep={}, threshold=85%)\nUsage: `/compact auto on|off` or `/compact [keep]`", on, keep));
+                }
             } else {
-                app.conversation.add_message("assistant".into(), format!("Nothing to compact ({} msgs)", n));
+                let keep: usize = first.parse().unwrap_or_else(|_| app.config.resolve_compact_keep());
+                match app.conversation.compact(keep) {
+                    Some((_, report)) => app.conversation.add_message("assistant".into(), report),
+                    None => app.conversation.add_message("assistant".into(), format!("Nothing to compact ({} msgs)", app.conversation.messages.len())),
+                }
             }
             app.save_session();
             app.is_home = false;
@@ -624,7 +699,7 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
             return Ok(true);
         }
         "/hotkeys" => {
-            app.conversation.add_message("assistant".into(), "**Keys:**\n- `Enter` send · `Shift+Enter/Ctrl+J` newline\n- `Tab` complete `/` or `@` · `Up/Down` palette/history\n- `Ctrl+C` clear/quit · `Ctrl+D` quit · `Ctrl+U/K/W` edit · `Ctrl+A/E` jump\n- `Ctrl+O` expand tools · `Esc` cancel · `PgUp/PgDn` scroll".into());
+            app.conversation.add_message("assistant".into(), "**Keys:**\n- `Enter` send · `Shift+Enter/Ctrl+J` newline\n- `Tab` complete `/` or `@` · `Up/Down` palette/history\n- `Ctrl+C` clear/quit · `Ctrl+D` quit · `Ctrl+U/K/W` edit · `Ctrl+A/E` jump\n- `Ctrl+O` expand tools · `Esc` cancel · `PgUp/PgDn` scroll\n- approval modal: `y` once · `a` always · `n`/`Esc` deny".into());
             app.save_session();
             app.is_home = false;
             return Ok(true);

@@ -1,5 +1,6 @@
 use crate::agent::conversation::Conversation;
 use crate::agent::llm::{AnthropicProvider, LLMProvider, OpenAIProvider, ProviderKind, StreamEvent};
+use crate::agent::permissions::{Decision, PermissionGate};
 use crate::agent::r#loop::start_agent_loop_with_limit;
 use crate::cli::Cli;
 use crate::config::Config;
@@ -106,8 +107,12 @@ pub fn build_ctx(cli: &Cli) -> Result<HeadlessCtx> {
     })
 }
 
-fn make_provider(ctx: &HeadlessCtx) -> Box<dyn LLMProvider> {
-    match ctx.provider_kind {
+fn permission_gate(ctx: &HeadlessCtx, cli: &Cli) -> PermissionGate {
+    let auto = cli.yes || ctx.config.resolve_auto_approve();
+    PermissionGate::new(auto)
+}
+
+fn make_provider(ctx: &HeadlessCtx) -> Box<dyn LLMProvider> {    match ctx.provider_kind {
         ProviderKind::OpenAI => Box::new(OpenAIProvider::new(
             ctx.config.resolve_api_key("openai"),
             ctx.model.clone(),
@@ -138,9 +143,11 @@ pub async fn run_print(prompt: &str, cli: &Cli) -> Result<()> {
     let cancel = Arc::new(AtomicBool::new(false));
     let registry = ctx.tool_registry.clone();
     let max_iter = ctx.max_iterations;
+    let perm = permission_gate(&ctx, cli);
+    let perm_loop = perm.clone();
 
     tokio::spawn(async move {
-        start_agent_loop_with_limit(provider, messages, tools, registry, tx, cancel, max_iter).await;
+        start_agent_loop_with_limit(provider, messages, tools, registry, tx, cancel, max_iter, perm_loop).await;
     });
 
     let mut final_text = String::new();
@@ -150,6 +157,11 @@ pub async fn run_print(prompt: &str, cli: &Cli) -> Result<()> {
             StreamEvent::Text(t) => final_text.push_str(&t),
             StreamEvent::Usage { input_tokens, output_tokens } => {
                 usage = Some((input_tokens, output_tokens));
+            }
+            StreamEvent::PermissionRequest { id, name, .. } => {
+                // Headless has no modal: deny unless --yes / auto-approve.
+                eprintln!("[denied {}: use --yes to allow]", name);
+                perm.resolve(&id, Decision::Deny);
             }
             StreamEvent::Done => break,
             _ => {}
@@ -193,9 +205,11 @@ pub async fn run_json(prompt: &str, cli: &Cli) -> Result<()> {
     // session accumulation
     let mut final_text = String::new();
     let mut all_tool_msgs: Vec<crate::agent::conversation::Message> = Vec::new();
+    let perm = permission_gate(&ctx, cli);
+    let perm_loop = perm.clone();
 
     tokio::spawn(async move {
-        start_agent_loop_with_limit(provider, messages, tools, registry, tx, cancel, max_iter).await;
+        start_agent_loop_with_limit(provider, messages, tools, registry, tx, cancel, max_iter, perm_loop).await;
     });
 
     while let Some(ev) = rx.recv().await {
@@ -218,6 +232,14 @@ pub async fn run_json(prompt: &str, cli: &Cli) -> Result<()> {
             }
             StreamEvent::Usage { input_tokens, output_tokens } => {
                 println!("{}", json!({"type": "usage", "input_tokens": input_tokens, "output_tokens": output_tokens}));
+            }
+            StreamEvent::PermissionRequest { id, name, args } => {
+                println!("{}", json!({"type": "tool_call", "id": id, "name": name, "args": args}));
+                println!("{}", json!({"type": "tool_result", "id": id, "name": name, "result": {"error": "denied: re-run with --yes to allow mutating tools"}}));
+                perm.resolve(&id, Decision::Deny);
+            }
+            StreamEvent::PermissionResult { id, approved } => {
+                println!("{}", json!({"type": "permission", "id": id, "approved": approved}));
             }
             StreamEvent::Done => break,
         }
@@ -298,8 +320,10 @@ pub async fn run_rpc(cli: &Cli) -> Result<()> {
                 let cancel = Arc::new(AtomicBool::new(false));
                 let registry = ctx.tool_registry.clone();
                 let max_iter = ctx.max_iterations;
+                let perm = permission_gate(&ctx, cli);
+                let perm_loop = perm.clone();
                 tokio::spawn(async move {
-                    start_agent_loop_with_limit(provider, messages, tools, registry, tx, cancel, max_iter).await;
+                    start_agent_loop_with_limit(provider, messages, tools, registry, tx, cancel, max_iter, perm_loop).await;
                 });
                 let mut final_text = String::new();
                 while let Some(ev) = rx.recv().await {
@@ -316,6 +340,13 @@ pub async fn run_rpc(cli: &Cli) -> Result<()> {
                         }
                         StreamEvent::Usage { input_tokens, output_tokens } => {
                             println!("{}", json!({"type":"usage","input_tokens":input_tokens,"output_tokens":output_tokens}));
+                        }
+                        StreamEvent::PermissionRequest { id, name, .. } => {
+                            println!("{}", json!({"type":"error","error": format!("denied {}: rpc headless requires pre-approval", name)}));
+                            perm.resolve(&id, Decision::Deny);
+                        }
+                        StreamEvent::PermissionResult { id, approved } => {
+                            println!("{}", json!({"type":"permission","id":id,"approved":approved}));
                         }
                         StreamEvent::Done => break,
                     }

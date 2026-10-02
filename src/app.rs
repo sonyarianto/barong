@@ -1,6 +1,7 @@
-use crate::agent::r#loop::start_agent_loop;
+use crate::agent::r#loop::start_agent_loop_with_limit;
 use crate::agent::conversation::Conversation;
 use crate::agent::llm::{LLMProvider, OpenAIProvider, AnthropicProvider, StreamEvent, ProviderKind};
+use crate::agent::permissions::{Decision, PendingTool, PermissionGate};
 use crate::config::Config;
 use crate::mcp::{McpServer, McpToolAdapter};
 use crate::session::SessionManager;
@@ -38,6 +39,8 @@ pub struct App {
     pub tool_expanded: bool,
     pub notice: Option<String>,
     pub spinner_tick: usize,
+    pub permission_gate: PermissionGate,
+    pub pending_approval: Option<PendingTool>,
 }
 
 impl App {
@@ -72,6 +75,7 @@ impl App {
         }
 
         let tool_registry = Arc::new(tool_registry);
+        let permission_gate = PermissionGate::new(config.resolve_auto_approve());
 
         Self {
             conversation,
@@ -96,6 +100,19 @@ impl App {
             tool_expanded: false,
             notice: None,
             spinner_tick: 0,
+            permission_gate,
+            pending_approval: None,
+        }
+    }
+
+    pub fn approve_pending(&mut self, decision: Decision) {
+        if let Some(p) = self.pending_approval.take() {
+            self.permission_gate.resolve(&p.id, decision.clone());
+            self.notice = Some(match decision {
+                Decision::AllowOnce => format!("allowed {} once", p.name),
+                Decision::AllowSession => format!("always allow {} this session", p.name),
+                Decision::Deny => format!("denied {}", p.name),
+            });
         }
     }
 
@@ -107,6 +124,33 @@ impl App {
         }
         chars += self.streaming_text.len();
         (chars as f32 / 4.0 / 128_000.0).clamp(0.0, 1.0)
+    }
+
+    pub fn auto_compact_threshold(&self) -> f32 {
+        0.85
+    }
+
+    /// Compact before an agent run if context is hot. Returns report if compacted.
+    pub fn maybe_auto_compact(&mut self) -> Option<String> {
+        if !self.config.resolve_auto_compact() {
+            return None;
+        }
+        let usage = self.context_usage();
+        let n = self.conversation.messages.len();
+        if usage < self.auto_compact_threshold() && n <= 100 {
+            return None;
+        }
+        let keep = self.config.resolve_compact_keep();
+        if let Some((dropped, _)) = self.conversation.compact(keep) {
+            self.save_session();
+            return Some(format!(
+                "auto-compacted: dropped {} msgs, kept last {} (ctx was {:.0}%)",
+                dropped,
+                keep,
+                usage * 100.0
+            ));
+        }
+        None
     }
 
     pub fn cwd_short(&self) -> String {
@@ -162,6 +206,17 @@ impl App {
                             .add_message("tool".into(), format!("\n{}", summary));
                         self.should_auto_scroll = true;
                     }
+                    Ok(StreamEvent::PermissionRequest { id, name, args }) => {
+                        self.pending_approval = Some(PendingTool { id, name, args });
+                        self.status.tool_status = "waiting approval".into();
+                        self.should_auto_scroll = true;
+                    }
+                    Ok(StreamEvent::PermissionResult { id: _, approved }) => {
+                        if !approved {
+                            self.notice = Some("tool denied".into());
+                        }
+                        self.status.tool_status = "processing...".into();
+                    }
                     Ok(StreamEvent::Done) => {
                         if !self.streaming_text.is_empty() {
                             let text = std::mem::take(&mut self.streaming_text);
@@ -169,6 +224,8 @@ impl App {
                         }
                         self.save_session();
                         self.event_rx = None;
+                        self.pending_approval = None;
+                        self.permission_gate.clear_pending();
                         self.status.tool_status = "idle".into();
                         self.should_auto_scroll = true;
                         break;
@@ -181,6 +238,8 @@ impl App {
                         }
                         self.save_session();
                         self.event_rx = None;
+                        self.pending_approval = None;
+                        self.permission_gate.clear_pending();
                         self.status.tool_status = "idle".into();
                         break;
                     }
@@ -231,6 +290,10 @@ impl App {
     }
 
     pub fn start_agent(&mut self) {
+        if let Some(report) = self.maybe_auto_compact() {
+            self.notice = Some(report.clone());
+            self.conversation.add_message("assistant".into(), format!("_{}_", report));
+        }
         let context_block = self.workspace.summary();
         let system_prompt = format!(
             "{}\n\n## Workspace Context\n{}",
@@ -258,9 +321,10 @@ impl App {
         self.cancelled.store(false, Ordering::Relaxed);
         let cancel_flag = self.cancelled.clone();
         let tool_registry = self.tool_registry.clone();
+        let perm = self.permission_gate.clone();
 
         tokio::spawn(async move {
-            start_agent_loop(provider, context, tools, tool_registry, tx, cancel_flag).await;
+            start_agent_loop_with_limit(provider, context, tools, tool_registry, tx, cancel_flag, 25, perm).await;
         });
 
         self.event_rx = Some(rx);

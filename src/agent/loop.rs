@@ -1,5 +1,6 @@
 use crate::agent::conversation::{Message, ToolCallFunction, ToolCallMessage};
 use crate::agent::llm::{LLMProvider, StreamEvent, ToolDef};
+use crate::agent::permissions::{Decision, PermissionGate};
 use crate::tools::ToolRegistry;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -13,7 +14,17 @@ pub async fn start_agent_loop(
     tx: mpsc::Sender<StreamEvent>,
     cancelled: Arc<AtomicBool>,
 ) {
-    start_agent_loop_with_limit(provider, messages, tools, tool_registry, tx, cancelled, 25).await;
+    start_agent_loop_with_limit(
+        provider,
+        messages,
+        tools,
+        tool_registry,
+        tx,
+        cancelled,
+        25,
+        PermissionGate::new(true),
+    )
+    .await;
 }
 
 pub async fn start_agent_loop_with_limit(
@@ -24,6 +35,7 @@ pub async fn start_agent_loop_with_limit(
     tx: mpsc::Sender<StreamEvent>,
     cancelled: Arc<AtomicBool>,
     max_iterations: u32,
+    perm: PermissionGate,
 ) {
     let mut iteration = 0u32;
     let max_iterations = max_iterations.clamp(1, 100);
@@ -67,6 +79,7 @@ pub async fn start_agent_loop_with_limit(
                         .await;
                 }
                 StreamEvent::Done => break,
+                StreamEvent::PermissionRequest { .. } | StreamEvent::PermissionResult { .. } => {}
             }
         }
 
@@ -113,6 +126,47 @@ pub async fn start_agent_loop_with_limit(
                 break;
             }
 
+            // Permission gate: mutating tools need explicit approval unless
+            // auto-approve is on or the tool was allowed for this session.
+            if PermissionGate::requires_approval(name)
+                && !perm.auto_approve()
+                && !perm.is_session_allowed(name)
+            {
+                perm.request(id.clone(), name.clone(), args.clone());
+                let _ = tx
+                    .send(StreamEvent::PermissionRequest {
+                        id: id.clone(),
+                        name: name.clone(),
+                        args: args.clone(),
+                    })
+                    .await;
+                let approved = wait_for_approval(&perm, id, &cancelled).await;
+                let _ = tx
+                    .send(StreamEvent::PermissionResult {
+                        id: id.clone(),
+                        approved,
+                    })
+                    .await;
+                if !approved {
+                    let value =
+                        serde_json::json!({ "error": format!("denied by user: {}", name) });
+                    all_messages.push(Message {
+                        role: "tool".into(),
+                        content: Some(value.to_string()),
+                        tool_calls: None,
+                        tool_call_id: Some(id.clone()),
+                    });
+                    let _ = tx
+                        .send(StreamEvent::ToolResult {
+                            id: id.clone(),
+                            name: name.clone(),
+                            result: value,
+                        })
+                        .await;
+                    continue;
+                }
+            }
+
             if let Some(tool) = tool_registry.get(name) {
                 let result = tool.call(args.clone(), Some(tx.clone())).await;
                 let value = match result {
@@ -155,6 +209,25 @@ pub async fn start_agent_loop_with_limit(
     }
 
     let _ = tx.send(StreamEvent::Done).await;
+}
+
+async fn wait_for_approval(
+    perm: &PermissionGate,
+    id: &str,
+    cancelled: &Arc<AtomicBool>,
+) -> bool {
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return false;
+        }
+        if let Some(d) = perm.poll(id) {
+            return match d {
+                Decision::AllowOnce | Decision::AllowSession => true,
+                Decision::Deny => false,
+            };
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 pub fn summarize_result(tool: &str, content: &str, max_lines: usize) -> String {
