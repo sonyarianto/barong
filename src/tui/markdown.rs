@@ -2,11 +2,17 @@ use crate::tui::syntax;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-pub struct MarkdownRenderer;
+pub struct MarkdownRenderer {
+    code_theme: &'static str,
+}
 
 impl MarkdownRenderer {
     pub fn new() -> Self {
-        Self
+        Self { code_theme: "base16-ocean.dark" }
+    }
+
+    pub fn with_code_theme(code_theme: &'static str) -> Self {
+        Self { code_theme }
     }
 
     pub fn render<'a>(&self, text: &'a str, role: &str) -> Vec<Line<'a>> {
@@ -90,9 +96,10 @@ impl MarkdownRenderer {
 
     fn emit_code_block<'a>(&self, lines: &mut Vec<Line<'a>>, prefix: &Span<'a>, lang: &str, code_lines: &[String]) {
         let lang_opt = if lang.is_empty() { None } else { Some(lang) };
-        let highlighted = syntax::highlight_code_block(
+        let highlighted = syntax::highlight_code_block_with_theme(
             code_lines.iter().map(|s| s.as_str()).collect(),
             lang_opt,
+            self.code_theme,
         );
 
         for (spans, _is_bold) in highlighted {

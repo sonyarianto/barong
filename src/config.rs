@@ -141,6 +141,21 @@ impl Config {
         20
     }
 
+    pub fn resolve_theme(&self) -> String {
+        if let Some(t) = &self.theme {
+            if !t.trim().is_empty() {
+                return t.trim().to_lowercase();
+            }
+        }
+        if let Ok(s) = std::env::var("BARONG_THEME") {
+            let t = s.trim().to_lowercase();
+            if !t.is_empty() {
+                return t;
+            }
+        }
+        "dark".into()
+    }
+
     pub fn resolve_extra_tools(&self) -> Vec<String> {
         if self.extra_tools.is_empty() {
             // Env override: BARONG_EXTRA_TOOLS="grep,glob,delegate" or "all"

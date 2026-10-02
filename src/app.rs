@@ -7,6 +7,7 @@ use crate::mcp::{McpServer, McpToolAdapter};
 use crate::session::SessionManager;
 use crate::tui::input::InputState;
 use crate::tui::status::StatusBar;
+use crate::tui::theme::{self, Theme};
 use crate::tools::ToolRegistry;
 use crate::workspace::WorkspaceContext;
 use anyhow::Result;
@@ -41,6 +42,8 @@ pub struct App {
     pub spinner_tick: usize,
     pub permission_gate: PermissionGate,
     pub pending_approval: Option<PendingTool>,
+    pub theme: Theme,
+    pub tree_visible: bool,
 }
 
 impl App {
@@ -76,6 +79,7 @@ impl App {
 
         let tool_registry = Arc::new(tool_registry);
         let permission_gate = PermissionGate::new(config.resolve_auto_approve());
+        let theme = theme::resolve(&config.resolve_theme());
 
         Self {
             conversation,
@@ -102,7 +106,15 @@ impl App {
             spinner_tick: 0,
             permission_gate,
             pending_approval: None,
+            theme,
+            tree_visible: false,
         }
+    }
+
+    pub fn set_theme(&mut self, name: &str) {
+        self.theme = theme::resolve(name);
+        self.config.theme = Some(self.theme.name.clone());
+        self.notice = Some(format!("theme: {}", self.theme.name));
     }
 
     pub fn approve_pending(&mut self, decision: Decision) {

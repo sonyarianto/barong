@@ -91,6 +91,10 @@ pub fn all_commands() -> Vec<(&'static str, &'static str)> {
         ("/tools", "list available tools"),
         ("/allow", "allow tool — /allow <tool|all>"),
         ("/approve", "auto-approve mode — /approve on|off"),
+        ("/theme", "switch theme — /theme [dark|light|barong]"),
+        ("/tree", "toggle file tree panel"),
+        ("/branch", "fork session — /branch [name]"),
+        ("/log", "list session branches"),
         ("/reload", "reload workspace context"),
         ("/hotkeys", "show keyboard shortcuts"),
         ("/help", "show this help"),
@@ -345,6 +349,12 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                     app.notice = Some(if app.tool_expanded { "tool output expanded" } else { "tool output collapsed" }.into());
                     return Ok(());
                 }
+                KeyCode::Char('t') | KeyCode::Char('T') => {
+                    app.workspace = crate::workspace::WorkspaceContext::new();
+                    app.tree_visible = !app.tree_visible;
+                    app.notice = Some(if app.tree_visible { "tree panel on" } else { "tree panel off" }.into());
+                    return Ok(());
+                }
                 _ => {}
             }
         }
@@ -595,7 +605,7 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
         }
         "/session" => {
             let info = format!(
-                "**Session:** `{}`\n- msgs: {}\n- model: `{}`\n- cwd: `{}`\n- ctx: ~{}%\n- auto-compact: {} (keep={})",
+                "**Session:** `{}`\n- msgs: {}\n- model: `{}`\n- cwd: `{}`\n- ctx: ~{}%\n- auto-compact: {} (keep={})\n- theme: `{}`\n- tree: {}",
                 app.session_id.as_deref().unwrap_or("(unsaved)"),
                 app.conversation.messages.len(),
                 app.current_model,
@@ -603,6 +613,8 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
                 (app.context_usage() * 100.0) as u32,
                 app.config.resolve_auto_compact(),
                 app.config.resolve_compact_keep(),
+                app.theme.name,
+                if app.tree_visible { "on" } else { "off" },
             );
             app.conversation.add_message("assistant".into(), info);
             app.save_session();
@@ -698,8 +710,67 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
             app.is_home = false;
             return Ok(true);
         }
+        "/theme" => {
+            if arg.is_empty() {
+                let mut out = String::from("**Themes:**\n");
+                for (n, d) in crate::tui::theme::all_themes() {
+                    let cur = if n == app.theme.name { " (current)" } else { "" };
+                    out.push_str(&format!("- `{}` — {}{}\n", n, d, cur));
+                }
+                out.push_str("\nUse `/theme <name>`");
+                app.conversation.add_message("assistant".into(), out);
+            } else {
+                let names: Vec<&str> = crate::tui::theme::all_themes().iter().map(|(n, _)| *n).collect();
+                if names.contains(&arg.to_lowercase().as_str()) {
+                    app.set_theme(&arg);
+                    app.conversation.add_message("assistant".into(), format!("Theme set to `{}`", app.theme.name));
+                } else {
+                    app.conversation.add_message("assistant".into(), format!("Unknown theme `{}`. Try `/theme`.", arg));
+                }
+            }
+            app.save_session();
+            app.is_home = false;
+            return Ok(true);
+        }
+        "/tree" => {
+            app.workspace = crate::workspace::WorkspaceContext::new();
+            app.tree_visible = !app.tree_visible;
+            app.notice = Some(if app.tree_visible { "tree panel on" } else { "tree panel off" }.into());
+            app.is_home = false;
+            return Ok(true);
+        }
+        "/branch" => {
+            let name = if arg.is_empty() { "branch" } else { arg };
+            let parent = app.session_id.clone();
+            let id = app.session_manager.fork(&app.conversation.messages, parent.as_deref(), name);
+            app.session_id = Some(id.clone());
+            app.conversation.add_message("assistant".into(), format!("Branched `{}` from `{}`", id, parent.as_deref().unwrap_or("(unsaved)")));
+            app.save_session();
+            app.is_home = false;
+            return Ok(true);
+        }
+        "/log" => {
+            let mut sessions = app.session_manager.list_sessions();
+            sessions.sort_by(|a, b| b.updated.cmp(&a.updated));
+            if sessions.is_empty() {
+                app.conversation.add_message("assistant".into(), "No saved sessions.".into());
+            } else {
+                let mut out = String::from("**Sessions:**\n");
+                for s in sessions.iter().take(10) {
+                    let cur = if Some(&s.id) == app.session_id.as_ref() { " ← current" } else { "" };
+                    let branch = s.branch.as_deref().unwrap_or("-");
+                    let parent = s.parent_id.as_deref().unwrap_or("-");
+                    out.push_str(&format!("- `{}` — {} msgs · branch `{}` · parent `{}`{}\n", s.id, s.messages.len(), branch, parent, cur));
+                }
+                out.push_str("\nUse `/resume <id>` or `/branch [name]`");
+                app.conversation.add_message("assistant".into(), out);
+            }
+            app.save_session();
+            app.is_home = false;
+            return Ok(true);
+        }
         "/hotkeys" => {
-            app.conversation.add_message("assistant".into(), "**Keys:**\n- `Enter` send · `Shift+Enter/Ctrl+J` newline\n- `Tab` complete `/` or `@` · `Up/Down` palette/history\n- `Ctrl+C` clear/quit · `Ctrl+D` quit · `Ctrl+U/K/W` edit · `Ctrl+A/E` jump\n- `Ctrl+O` expand tools · `Esc` cancel · `PgUp/PgDn` scroll\n- approval modal: `y` once · `a` always · `n`/`Esc` deny".into());
+            app.conversation.add_message("assistant".into(), "**Keys:**\n- `Enter` send · `Shift+Enter/Ctrl+J` newline\n- `Tab` complete `/` or `@` · `Up/Down` palette/history\n- `Ctrl+C` clear/quit · `Ctrl+D` quit · `Ctrl+U/K/W` edit · `Ctrl+A/E` jump\n- `Ctrl+O` expand tools · `Ctrl+T` tree panel · `Esc` cancel · `PgUp/PgDn` scroll\n- approval modal: `y` once · `a` always · `n`/`Esc` deny".into());
             app.save_session();
             app.is_home = false;
             return Ok(true);

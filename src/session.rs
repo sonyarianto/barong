@@ -8,6 +8,10 @@ pub struct Session {
     pub created: String,
     pub updated: String,
     pub messages: Vec<Message>,
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    #[serde(default)]
+    pub branch: Option<String>,
 }
 
 pub struct SessionManager {
@@ -89,6 +93,8 @@ impl SessionManager {
             created: now.clone(),
             updated: now,
             messages: messages.to_vec(),
+            parent_id: None,
+            branch: None,
         };
         let path = self.session_path(&id);
         if let Ok(json) = serde_json::to_string_pretty(&session) {
@@ -112,6 +118,25 @@ impl SessionManager {
             }
         }
     }
+
+    /// Fork current messages into a new branch session.
+    pub fn fork(&self, messages: &[Message], parent_id: Option<&str>, branch: &str) -> String {
+        let id = chrono_format();
+        let now = human_time();
+        let session = Session {
+            id: id.clone(),
+            created: now.clone(),
+            updated: now,
+            messages: messages.to_vec(),
+            parent_id: parent_id.map(|s| s.to_string()),
+            branch: Some(branch.to_string()),
+        };
+        let path = self.session_path(&id);
+        if let Ok(json) = serde_json::to_string_pretty(&session) {
+            let _ = std::fs::write(path, json);
+        }
+        id
+    }
 }
 
 fn human_time() -> String {
@@ -125,5 +150,5 @@ fn human_time() -> String {
 fn chrono_format() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-    format!("{}", dur.as_secs())
+    format!("{}.{:03}", dur.as_secs(), dur.subsec_millis())
 }

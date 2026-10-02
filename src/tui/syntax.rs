@@ -18,12 +18,20 @@ fn init() -> &'static Highlighter {
 }
 
 pub fn highlight_code_block(lines: Vec<&str>, lang: Option<&str>) -> Vec<(Vec<(Style, String)>, bool)> {
+    highlight_code_block_with_theme(lines, lang, "base16-ocean.dark")
+}
+
+pub fn highlight_code_block_with_theme(
+    lines: Vec<&str>,
+    lang: Option<&str>,
+    code_theme: &str,
+) -> Vec<(Vec<(Style, String)>, bool)> {
     let h = init();
     let syntax = lang
         .and_then(|l| h.ss.find_syntax_by_token(l))
         .unwrap_or_else(|| h.ss.find_syntax_plain_text());
 
-    let theme = &h.ts.themes["base16-ocean.dark"];
+    let theme = h.ts.themes.get(code_theme).unwrap_or(&h.ts.themes["base16-ocean.dark"]);
 
     use syntect::easy::HighlightLines;
     let mut highlighter = HighlightLines::new(syntax, theme);

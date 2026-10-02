@@ -16,7 +16,16 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         ])
         .split(area);
 
-    render_chat(frame, chunks[0], app);
+    if app.tree_visible {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(32), Constraint::Min(1)])
+            .split(chunks[0]);
+        render_tree(frame, cols[0], app);
+        render_chat(frame, cols[1], app);
+    } else {
+        render_chat(frame, chunks[0], app);
+    }
     render_input(frame, chunks[1], app);
     // palette overlays above input
     if app.input.buffer.starts_with('/') && app.event_rx.is_none() && app.pending_approval.is_none() {
@@ -28,26 +37,64 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
 }
 
+fn render_tree(frame: &mut Frame, area: Rect, app: &App) {
+    let t = &app.theme;
+    let mut lines: Vec<Line> = Vec::new();
+    if app.workspace.is_git_repo {
+        lines.push(Line::from(vec![
+            Span::styled("⎇ ", Style::default().fg(t.accent)),
+            Span::styled(
+                app.workspace.git_branch.clone(),
+                Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        if !app.workspace.git_status.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("~{} changed", app.workspace.git_status.len()),
+                Style::default().fg(t.warning),
+            )));
+        }
+    }
+    let tree_lines: Vec<&str> = app.workspace.file_tree.lines().take(60).collect();
+    if tree_lines.is_empty() {
+        lines.push(Line::from(Span::styled("(empty)", Style::default().fg(t.muted))));
+    } else {
+        for l in tree_lines {
+            lines.push(Line::from(Span::styled(
+                truncate(l, 30),
+                Style::default().fg(t.muted),
+            )));
+        }
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .title(" tree ")
+        .border_style(Style::default().fg(t.muted));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
 fn render_chat(frame: &mut Frame, area: Rect, app: &mut App) {
+    let t = app.theme.clone();
     if app.is_home && app.conversation.messages.is_empty() && app.streaming_text.is_empty() {
         let lines = vec![
             Line::from(Span::raw("")),
             Line::from(Span::styled(
                 "  barong",
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                Style::default().fg(t.primary).add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
                 "  Terminal coding agent",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(t.muted),
             )),
             Line::from(Span::raw("")),
             Line::from(Span::styled(
                 "  Type a message to start  •  / commands  •  @ files  •  Esc cancel",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(t.muted),
             )),
             Line::from(Span::styled(
-                format!("  {}  •  {}  •  {} tools", app.cwd_short(), app.current_model, app.tool_registry.tool_names().len()),
-                Style::default().fg(Color::DarkGray),
+                format!("  {}  •  {}  •  {} tools  •  {} theme", app.cwd_short(), app.current_model, app.tool_registry.tool_names().len(), t.name),
+                Style::default().fg(t.muted),
             )),
         ];
         let p = Paragraph::new(lines);
@@ -55,13 +102,13 @@ fn render_chat(frame: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
-    let md = crate::tui::markdown::MarkdownRenderer::new();
+    let md = crate::tui::markdown::MarkdownRenderer::with_code_theme(app.theme.code_theme);
     let mut all_lines: Vec<Line> = Vec::new();
 
     for msg in &app.conversation.messages {
         if msg.role == "tool" {
             let content = msg.content.as_deref().unwrap_or("");
-            for line in compact_tool_lines(content, app.tool_expanded) {
+            for line in compact_tool_lines(content, app.tool_expanded, &t) {
                 all_lines.push(line);
             }
             continue;
@@ -79,7 +126,7 @@ fn render_chat(frame: &mut Frame, area: Rect, app: &mut App) {
         }
         all_lines.push(Line::from(Span::styled(
             "█",
-            Style::default().fg(Color::Green).add_modifier(Modifier::SLOW_BLINK),
+            Style::default().fg(t.primary).add_modifier(Modifier::SLOW_BLINK),
         )));
     } else if app.event_rx.is_some() {
         app.spinner_tick = app.spinner_tick.wrapping_add(1);
@@ -87,7 +134,7 @@ fn render_chat(frame: &mut Frame, area: Rect, app: &mut App) {
         let f = frames[(app.spinner_tick / 4) % frames.len()];
         all_lines.push(Line::from(Span::styled(
             format!("{} working… (Esc to cancel)", f),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(t.warning),
         )));
     }
 
@@ -103,7 +150,7 @@ fn render_chat(frame: &mut Frame, area: Rect, app: &mut App) {
 }
 
 /// Compact tool lines: `● read path` + `└─ ok` collapsed, full when expanded.
-fn compact_tool_lines(content: &str, expanded: bool) -> Vec<Line<'_>> {
+fn compact_tool_lines<'a>(content: &'a str, expanded: bool, t: &'a crate::tui::theme::Theme) -> Vec<Line<'a>> {
     let first = content.lines().next().unwrap_or("").trim();
     let is_call = first.starts_with('▸');
     let is_result = first.starts_with('◂') || content.trim_start().starts_with('◂');
@@ -115,11 +162,11 @@ fn compact_tool_lines(content: &str, expanded: bool) -> Vec<Line<'_>> {
             .trim()
             .to_string();
         let short = truncate(&short, 120);
-        return vec![Line::from(Span::styled(short, Style::default().fg(Color::Yellow)))];
+        return vec![Line::from(Span::styled(short, Style::default().fg(t.warning)))];
     }
     if is_result {
-        let is_err = content.to_lowercase().contains("error");
-        let color = if is_err { Color::Red } else { Color::Green };
+        let is_err = content.to_lowercase().contains("error") || content.to_lowercase().contains("denied");
+        let color = if is_err { t.error } else { t.success };
         if !expanded {
             let summary = first.replace('◂', "└─").replace("**", "");
             let summary = truncate(summary.trim(), 120);
@@ -136,14 +183,14 @@ fn compact_tool_lines(content: &str, expanded: bool) -> Vec<Line<'_>> {
             } else {
                 out.push(Line::from(Span::styled(
                     truncate(l, 160),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(t.muted),
                 )));
             }
         }
         if content.lines().count() > 30 {
             out.push(Line::from(Span::styled(
                 format!("… {} more (Ctrl+O to collapse)", content.lines().count() - 30),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(t.muted),
             )));
         }
         return out;
@@ -151,7 +198,7 @@ fn compact_tool_lines(content: &str, expanded: bool) -> Vec<Line<'_>> {
     // fallback: dim single block
     vec![Line::from(Span::styled(
         truncate(content, 160),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(t.muted),
     ))]
 }
 
@@ -164,6 +211,7 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 fn render_input(frame: &mut Frame, area: Rect, app: &App) {
+    let t = &app.theme;
     let busy = app.event_rx.is_some();
     let mut title = if busy { " working… " } else { " › " };
     if app.input.buffer.starts_with('/') {
@@ -176,13 +224,18 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
         .border_type(ratatui::widgets::BorderType::Rounded)
         .title(title)
         .border_style(if busy {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(t.warning)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(t.muted)
         });
 
     if busy {
-        let p = Paragraph::new(" (Esc to cancel)").block(block).style(Style::default().fg(Color::DarkGray));
+        let label = if app.pending_approval.is_some() {
+            " (y/a/n to decide)"
+        } else {
+            " (Esc to cancel)"
+        };
+        let p = Paragraph::new(label).block(block).style(Style::default().fg(t.muted));
         frame.render_widget(p, area);
         return;
     }
@@ -193,7 +246,7 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
         display.insert(app.input.cursor_pos, '█');
     }
     let hint = if display.is_empty() && !app.input.buffer.starts_with('/') {
-        Span::styled("message, / commands, @ files", Style::default().fg(Color::DarkGray))
+        Span::styled("message, / commands, @ files", Style::default().fg(t.muted))
     } else {
         Span::raw("")
     };
@@ -230,13 +283,13 @@ fn render_palette(frame: &mut Frame, chat: Rect, input: Rect, app: &App) {
         .enumerate()
         .map(|(i, (name, desc))| {
             let style = if start + i == selected {
-                Style::default().fg(Color::Black).bg(Color::Cyan)
+                Style::default().fg(Color::Black).bg(app.theme.accent)
             } else {
                 Style::default().fg(Color::White)
             };
             ListItem::new(Line::from(vec![
                 Span::styled(format!(" {:<10}", name), style),
-                Span::styled(format!(" {}", desc), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!(" {}", desc), Style::default().fg(app.theme.muted)),
             ]))
         })
         .collect();
@@ -249,36 +302,40 @@ fn render_palette(frame: &mut Frame, chat: Rect, input: Rect, app: &App) {
         .borders(Borders::ALL)
         .border_type(ratatui::widgets::BorderType::Rounded)
         .title(title)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(app.theme.muted));
     frame.render_widget(List::new(list_items).block(block), area);
 }
 
 fn render_status(frame: &mut Frame, area: Rect, app: &App) {
+    let t = &app.theme;
     let ctx = (app.context_usage() * 100.0) as u32;
-    let ctx_color = if ctx > 85 { Color::Red } else if ctx > 60 { Color::Yellow } else { Color::DarkGray };
+    let ctx_color = if ctx > 85 { t.error } else if ctx > 60 { t.warning } else { t.muted };
     let mut parts = vec![
-        Span::styled(format!(" {}", app.cwd_short()), Style::default().fg(Color::DarkGray)),
-        Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("{}", app.current_model), Style::default().fg(Color::Magenta)),
-        Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("msgs:{}", app.conversation.messages.len()), Style::default().fg(Color::DarkGray)),
-        Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!(" {}", app.cwd_short()), Style::default().fg(t.muted)),
+        Span::styled(" │ ", Style::default().fg(t.muted)),
+        Span::styled(format!("{}", app.current_model), Style::default().fg(t.accent)),
+        Span::styled(" │ ", Style::default().fg(t.muted)),
+        Span::styled(format!("msgs:{}", app.conversation.messages.len()), Style::default().fg(t.muted)),
+        Span::styled(" │ ", Style::default().fg(t.muted)),
         Span::styled(format!("ctx:{}%", ctx), Style::default().fg(ctx_color)),
+        Span::styled(" │ ", Style::default().fg(t.muted)),
+        Span::styled(format!("{}", t.name), Style::default().fg(t.muted)),
     ];
+    if app.tree_visible {
+        parts.push(Span::styled(" │ tree", Style::default().fg(t.accent)));
+    }
     if !app.status.token_count.is_empty() {
-        parts.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
-        parts.push(Span::styled(format!("{}", app.status.token_count), Style::default().fg(Color::DarkGray)));
+        parts.push(Span::styled(" │ ", Style::default().fg(t.muted)));
+        parts.push(Span::styled(format!("{}", app.status.token_count), Style::default().fg(t.muted)));
     }
     if app.event_rx.is_some() {
-        parts.push(Span::styled(" │ working…", Style::default().fg(Color::Yellow)));
+        parts.push(Span::styled(" │ working…", Style::default().fg(t.warning)));
     } else if app.status.tool_status != "idle" && !app.status.tool_status.is_empty() {
-        parts.push(Span::styled(format!(" │ {}", app.status.tool_status), Style::default().fg(Color::Yellow)));
+        parts.push(Span::styled(format!(" │ {}", app.status.tool_status), Style::default().fg(t.warning)));
     }
     if let Some(n) = &app.notice {
-        parts.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
-        parts.push(Span::styled(format!("{}", truncate(n, 60)), Style::default().fg(Color::Cyan)));
-    }
-    if !app.tool_expanded {
+        parts.push(Span::styled(" │ ", Style::default().fg(t.muted)));
+        parts.push(Span::styled(format!("{}", truncate(n, 60)), Style::default().fg(t.accent)));
     }
     let p = Paragraph::new(Line::from(parts));
     frame.render_widget(p, area);
@@ -286,6 +343,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_permission_modal(frame: &mut Frame, area: Rect, app: &App) {
     let Some(p) = &app.pending_approval else { return };
+    let t = &app.theme;
     let width = area.width.min(76);
     let height = 9u16;
     let x = area.x + (area.width.saturating_sub(width)) / 2;
@@ -297,23 +355,23 @@ fn render_permission_modal(frame: &mut Frame, area: Rect, app: &App) {
     let lines = vec![
         Line::from(Span::styled(
             format!(" Allow `{}` ?", p.name),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default().fg(t.warning).add_modifier(Modifier::BOLD),
         )),
-        Line::from(Span::styled(args_short, Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled(args_short, Style::default().fg(t.muted))),
         Line::from(Span::raw("")),
         Line::from(vec![
-            Span::styled(" [y] once ", Style::default().fg(Color::Black).bg(Color::Green)),
+            Span::styled(" [y] once ", Style::default().fg(Color::Black).bg(t.success)),
             Span::raw(" "),
-            Span::styled(" [a] always this session ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+            Span::styled(" [a] always this session ", Style::default().fg(Color::Black).bg(t.accent)),
             Span::raw(" "),
-            Span::styled(" [n] deny ", Style::default().fg(Color::Black).bg(Color::Red)),
+            Span::styled(" [n] deny ", Style::default().fg(Color::Black).bg(t.error)),
         ]),
-        Line::from(Span::styled(" Esc = deny", Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled(" Esc = deny", Style::default().fg(t.muted))),
     ];
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(ratatui::widgets::BorderType::Rounded)
         .title(" permission ")
-        .border_style(Style::default().fg(Color::Yellow));
+        .border_style(Style::default().fg(t.warning));
     frame.render_widget(Paragraph::new(lines).block(block), modal);
 }
