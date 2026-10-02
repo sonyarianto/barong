@@ -88,6 +88,7 @@ pub fn all_commands() -> Vec<(&'static str, &'static str)> {
         ("/compact", "compact context — /compact [keep=20] | /compact auto on|off"),
         ("/clear", "clear screen (same as /new)"),
         ("/model", "pick provider/model — /model [provider/model]"),
+        ("/models", "same as /model"),
         ("/login", "save API key — /login [provider]"),
         ("/logout", "remove saved key — /logout <provider>"),
         ("/tools", "list available tools"),
@@ -140,6 +141,14 @@ pub fn provider_entries(app: &App, filter: &str) -> Vec<(String, bool, String)> 
     out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     out.truncate(12);
     out
+}
+
+/// Returns the filter text if buffer is in `/model` picker mode
+/// (either `/model ` or `/models ` prefix).
+pub fn model_filter(buffer: &str) -> Option<&str> {
+    buffer
+        .strip_prefix("/model ")
+        .or_else(|| buffer.strip_prefix("/models "))
 }
 
 /// One entry in the `/model` picker: (provider, model, key-ready).
@@ -541,9 +550,8 @@ pub fn handle_events(app: &mut App) -> Result<()> {
             KeyCode::Home => app.input.cursor_pos = 0,
             KeyCode::End => app.input.cursor_pos = app.input.buffer.len(),
             KeyCode::Up => {
-                if app.input.buffer.starts_with("/model ") {
-                    let filter = app.input.buffer["/model ".len()..].to_string();
-                    let items = model_entries(app, &filter);
+                if let Some(f) = model_filter(&app.input.buffer).map(|s| s.to_string()) {
+                    let items = model_entries(app, &f);
                     if !items.is_empty() {
                         app.model_idx = (app.model_idx + items.len() - 1) % items.len();
                         app.model_navigated = true;
@@ -569,9 +577,8 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                 app.input.navigate_history(-1);
             }
             KeyCode::Down => {
-                if app.input.buffer.starts_with("/model ") {
-                    let filter = app.input.buffer["/model ".len()..].to_string();
-                    let items = model_entries(app, &filter);
+                if let Some(f) = model_filter(&app.input.buffer).map(|s| s.to_string()) {
+                    let items = model_entries(app, &f);
                     if !items.is_empty() {
                         app.model_idx = (app.model_idx + 1) % items.len();
                         app.model_navigated = true;
@@ -597,9 +604,8 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                 app.input.navigate_history(1);
             }
             KeyCode::Tab => {
-                if app.input.buffer.starts_with("/model ") {
-                    let filter = app.input.buffer["/model ".len()..].to_string();
-                    let items = model_entries(app, &filter);
+                if let Some(f) = model_filter(&app.input.buffer).map(|s| s.to_string()) {
+                    let items = model_entries(app, &f);
                     if !items.is_empty() {
                         let idx = app.model_idx % items.len();
                         let (p, m, _) = &items[idx];
@@ -727,7 +733,7 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
             app.status.tool_status = "idle".into();
             return Ok(true);
         }
-        "/model" => {
+        "/model" | "/models" => {
             if arg.is_empty() {
                 let mut out = format!(
                     "**Provider:** `{}`\n**Model:** `{}`\n**Key:** {} ({})\n\n**Ready models:**\n",
@@ -1173,6 +1179,15 @@ mod tests {
         let mut app = test_app();
         app.auth.set("nvidia", "nvapi-test-key");
         handle_slash(&mut app, "/model deepseek-ai/deepseek-r1").unwrap();
+        assert_eq!(app.provider_name, "nvidia");
+        assert_eq!(app.current_model, "deepseek-ai/deepseek-r1");
+    }
+
+    #[test]
+    fn models_alias_behaves_like_model() {
+        let mut app = test_app();
+        app.auth.set("nvidia", "nvapi-test-key");
+        handle_slash(&mut app, "/models nvidia").unwrap();
         assert_eq!(app.provider_name, "nvidia");
         assert_eq!(app.current_model, "deepseek-ai/deepseek-r1");
     }

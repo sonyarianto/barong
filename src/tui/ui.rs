@@ -28,7 +28,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
     render_input(frame, chunks[1], app);
     // pickers overlay above input (model/login pickers take over command palette)
-    let model_mode = app.input.buffer.starts_with("/model ");
+    let model_mode = crate::tui::input::model_filter(&app.input.buffer).is_some();
     let login_mode = app.input.buffer.starts_with("/login ");
     if model_mode && app.event_rx.is_none() && app.pending_approval.is_none() && app.pending_login.is_none() {
         render_model_picker(frame, chunks[0], chunks[1], app);
@@ -324,7 +324,7 @@ fn render_palette(frame: &mut Frame, chat: Rect, input: Rect, app: &App) {
 }
 
 fn render_model_picker(frame: &mut Frame, chat: Rect, input: Rect, app: &App) {
-    let filter = app.input.buffer["/model ".len()..].to_string();
+    let filter = crate::tui::input::model_filter(&app.input.buffer).unwrap_or("").to_string();
     let items = crate::tui::input::model_entries(app, &filter);
     if items.is_empty() {
         return;
