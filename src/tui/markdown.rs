@@ -8,6 +8,7 @@ pub struct MarkdownRenderer {
     muted: Color,
     warning: Color,
     success: Color,
+    panel: Color,
     /// Visible terminal width for full-width code rules (0 = compact fallback).
     width: u16,
 }
@@ -20,6 +21,7 @@ impl MarkdownRenderer {
             muted: Color::DarkGray,
             warning: Color::Yellow,
             success: Color::LightGreen,
+            panel: Color::Rgb(24, 25, 30),
             width: 0,
         }
     }
@@ -35,6 +37,7 @@ impl MarkdownRenderer {
             muted: theme.muted,
             warning: theme.warning,
             success: theme.success,
+            panel: theme.panel,
             width: 0,
         }
     }
@@ -69,12 +72,13 @@ impl MarkdownRenderer {
                     self.emit_code_block(&mut lines, &prefix, &code_block_lang, &code_block_lines);
                     code_block_lines.clear();
                     code_block_lang.clear();
-                    lines.push(self.code_footer(&prefix));
+                    // No footer rule: the container simply ends (OpenCode-style
+                    // calm — one accent, no four-border cage).
                 } else {
                     in_code_block = true;
                     code_block_lang = raw_line.trim_start().trim_start_matches("```").trim().to_string();
                     let lang = if code_block_lang.is_empty() { "code".to_string() } else { code_block_lang.clone() };
-                    lines.push(self.code_header(&prefix, &lang));
+                    lines.push(self.code_label(&prefix, &lang));
                 }
                 continue;
             }
@@ -152,10 +156,10 @@ impl MarkdownRenderer {
         lines
     }
 
-    /// Full-width rounded top rule with language label (pi/opencode style).
+    /// Container label row: dim language tag on panel background.
     /// Falls back to the compact header when the width is unknown (< 20).
-    fn code_header<'a>(&self, prefix: &Span<'a>, lang: &str) -> Line<'a> {
-        let inner = self.width.saturating_sub(prefix.width() as u16);
+    fn code_label<'a>(&self, prefix: &Span<'a>, lang: &str) -> Line<'a> {
+        let inner = self.width.saturating_sub(prefix.width() as u16) as usize;
         if inner < 20 {
             return Line::from(vec![
                 prefix.clone(),
@@ -164,26 +168,12 @@ impl MarkdownRenderer {
                 Span::styled(" ──", Style::default().fg(self.muted)),
             ]);
         }
-        let fill = inner.saturating_sub(4 + lang.chars().count() as u16) as usize;
+        let pad = inner.saturating_sub(2 + lang.chars().count());
         Line::from(vec![
             prefix.clone(),
-            Span::styled("╭─ ", Style::default().fg(self.muted)),
-            Span::styled(lang.to_string(), Style::default().fg(self.accent).add_modifier(Modifier::BOLD)),
-            Span::styled(format!(" {}", "─".repeat(fill)), Style::default().fg(self.muted)),
-        ])
-    }
-
-    fn code_footer<'a>(&self, prefix: &Span<'a>) -> Line<'a> {
-        let inner = self.width.saturating_sub(prefix.width() as u16);
-        if inner < 20 {
-            return Line::from(vec![
-                prefix.clone(),
-                Span::styled("──", Style::default().fg(self.muted)),
-            ]);
-        }
-        Line::from(vec![
-            prefix.clone(),
-            Span::styled(format!("╰{}", "─".repeat(inner.saturating_sub(1) as usize)), Style::default().fg(self.muted)),
+            Span::styled("┃ ", Style::default().fg(self.muted).bg(self.panel)),
+            Span::styled(lang.to_string(), Style::default().fg(self.muted).bg(self.panel)),
+            Span::styled(" ".repeat(pad), Style::default().bg(self.panel)),
         ])
     }
 
@@ -199,8 +189,8 @@ impl MarkdownRenderer {
 
         let gutter_w = code_lines.len().to_string().len().max(1);
         let inner = self.width.saturating_sub(prefix.width() as u16) as usize;
-        // content = inner − "│ "(2) − gutter − " │"(2)
-        let content_w = inner.saturating_sub(5 + gutter_w);
+        // content = inner − "┃ "(2) − gutter − no right border (open container)
+        let content_w = inner.saturating_sub(3 + gutter_w);
         if inner < 20 || content_w < 10 {
             // Compact fallback: no wrapping, left border only.
             for (i, (spans, _is_bold)) in highlighted.into_iter().enumerate() {
@@ -229,14 +219,13 @@ impl MarkdownRenderer {
                 let w: usize = seg.iter().map(|(_, t)| display_width(t)).sum();
                 let mut line_spans = vec![
                     prefix.clone(),
-                    Span::styled("│ ", Style::default().fg(self.muted)),
-                    Span::styled(gutter, Style::default().fg(self.muted)),
+                    Span::styled("┃ ", Style::default().fg(self.muted).bg(self.panel)),
+                    Span::styled(gutter, Style::default().fg(self.muted).bg(self.panel)),
                 ];
                 for (style, text) in seg {
-                    line_spans.push(Span::styled(text, style));
+                    line_spans.push(Span::styled(text, style.bg(self.panel)));
                 }
-                line_spans.push(Span::styled(" ".repeat(content_w.saturating_sub(w)), Style::default()));
-                line_spans.push(Span::styled(" │", Style::default().fg(self.muted)));
+                line_spans.push(Span::styled(" ".repeat(content_w.saturating_sub(w)), Style::default().bg(self.panel)));
                 lines.push(Line::from(line_spans));
             }
         }
@@ -579,8 +568,8 @@ mod tests {
         let long = "x".repeat(100);
         let text = format!("```go\n{}\n```", long);
         let out = md.render(&text, "assistant");
-        // header + wrapped body + footer; every row exactly 40 cells.
-        assert!(out.len() > 3, "must wrap, got {} rows", out.len());
+        // label + wrapped body; every row exactly 40 cells.
+        assert!(out.len() > 2, "must wrap, got {} rows", out.len());
         for (i, l) in out.iter().enumerate() {
             let s: String = l.spans.iter().map(|s| s.content.to_string()).collect();
             assert_eq!(s.width(), 40, "row {} width, got: {}", i, s);
@@ -650,17 +639,19 @@ mod tests {
         let out = flat(&md.render("well-known fact", "assistant"));
         assert_eq!(out, vec!["well-known fact".to_string()]);
     }
-
     #[test]
-    fn wide_rules_span_full_width() {        let md = MarkdownRenderer::new().with_width(60);
+    fn wide_container_rows_span_full_width() {
+        let md = MarkdownRenderer::new().with_width(60);
         let out = flat(&md.render("```go\nx\n```", "assistant"));
-        assert_eq!(out.len(), 3, "header + 1 code + footer, got: {:?}", out);
-        let header_w = out[0].chars().count();
-        let footer_w = out[2].chars().count();
-        assert!(out[0].starts_with("╭─ ") && out[0].contains("go"), "got: {}", out[0]);
-        assert_eq!(header_w, 60, "header must fill width, got: {}", out[0]);
-        assert!(out[2].starts_with('╰'), "got: {}", out[2]);
-        assert_eq!(footer_w, 60, "footer must fill width, got: {}", out[2]);
-        assert!(out[1].starts_with("│ "), "got: {}", out[1]);
+        // label row + 1 code row, no rules anywhere.
+        assert_eq!(out.len(), 2, "label + 1 code, got: {:?}", out);
+        assert!(out[0].contains("go"), "label, got: {}", out[0]);
+        assert!(!out[0].contains('╭') && !out[0].contains('─'), "no rules, got: {}", out[0]);
+        for (i, l) in out.iter().enumerate() {
+            use unicode_width::UnicodeWidthStr;
+            assert_eq!(l.width(), 60, "row {} full width, got: {}", i, l);
+            assert!(l.starts_with("┃ "), "left bar, got: {}", l);
+        }
+        assert!(out[1].contains('1'), "gutter, got: {}", out[1]);
     }
 }

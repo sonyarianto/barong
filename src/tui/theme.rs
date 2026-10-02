@@ -9,6 +9,10 @@ pub struct Theme {
     pub warning: Color,
     pub error: Color,
     pub muted: Color,
+    /// Flat panel background for code containers (OpenCode-style box feel
+    /// without the four-border cage). Falls back gracefully on transparent
+    /// terminals: the left bar stays visible on its own.
+    pub panel: Color,
     pub code_theme: &'static str,
 }
 
@@ -30,6 +34,7 @@ pub fn resolve(name: &str) -> Theme {
             warning: Color::Yellow,
             error: Color::Red,
             muted: Color::Gray,
+            panel: Color::Rgb(242, 243, 245),
             code_theme: "InspiredGitHub",
         },
         "barong" => Theme {
@@ -40,6 +45,7 @@ pub fn resolve(name: &str) -> Theme {
             warning: Color::Yellow,
             error: Color::Red,
             muted: Color::Gray,
+            panel: Color::Rgb(28, 23, 21),
             code_theme: "base16-ocean.dark",
         },
         _ => Theme {
@@ -50,6 +56,7 @@ pub fn resolve(name: &str) -> Theme {
             warning: Color::Yellow,
             error: Color::Red,
             muted: Color::DarkGray,
+            panel: Color::Rgb(24, 25, 30),
             code_theme: "base16-ocean.dark",
         },
     }
