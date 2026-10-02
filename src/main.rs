@@ -79,6 +79,8 @@ fn run_blocking(
         app.permission_gate.set_auto_approve(true);
     }
     app.apply_cli_overrides(provider, model);
+    // Refresh stale model catalogs in the background (login also triggers).
+    app.refresh_stale_models();
     while !app.should_quit {
         terminal.draw(|frame| app.render(frame))?;
         app.handle_stream()?;

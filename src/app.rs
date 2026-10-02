@@ -2,6 +2,7 @@ use crate::agent::r#loop::start_agent_loop_with_limit;
 use crate::agent::conversation::Conversation;
 use crate::agent::llm::{LLMProvider, OpenAIProvider, AnthropicProvider, StreamEvent, ProviderKind};
 use crate::agent::permissions::{Decision, PendingTool, PermissionGate};
+use crate::agent::models::{self, Discovered};
 use crate::auth::{resolve_api_key, AuthStore};
 use crate::config::Config;
 use crate::mcp::{McpServer, McpToolAdapter};
@@ -51,6 +52,7 @@ pub struct App {
     pub tree_visible: bool,
     pub auth: AuthStore,
     pub key_source: &'static str,
+    pub discovered: Discovered,
     pub pending_login: Option<String>,
     pub login_buffer: String,
     pub model_idx: usize,
@@ -148,6 +150,7 @@ impl App {
             tree_visible: false,
             auth,
             key_source,
+            discovered: Discovered::load(),
             pending_login: None,
             login_buffer: String::new(),
             model_idx: 0,
@@ -230,6 +233,46 @@ impl App {
 
     pub fn api_key(&self) -> String {
         resolve_api_key(&self.provider_name, &self.auth, &self.config).0
+    }
+
+    fn discovery_target(&self, provider_id: &str) -> Option<(String, String)> {
+        let id = provider_id.trim().to_lowercase();
+        let rpc = self.config.resolve_provider_config(&id);
+        if rpc.api != "openai" || rpc.base_url.is_empty() {
+            return None; // anthropic has no list endpoint; unknown has no URL
+        }
+        let (key, _) = resolve_api_key(&id, &self.auth, &self.config);
+        if key.is_empty() && id != "openrouter" && id != "ollama" {
+            return None; // gated endpoints need a key (openrouter is public)
+        }
+        Some((rpc.base_url.clone(), key))
+    }
+
+    /// Refresh one provider's model list in the background.
+    pub fn refresh_provider(&self, provider_id: &str) {
+        // Never hit the network under `cargo test`.
+        if cfg!(test) {
+            return;
+        }
+        let id = provider_id.trim().to_lowercase();
+        if let Some((base_url, key)) = self.discovery_target(&id) {
+            models::refresh_in_background(self.discovered.clone(), id, base_url, key);
+        }
+    }
+
+    /// Refresh stale providers at startup (prod only — tests never call this,
+    /// so no network happens under `cargo test`).
+    pub fn refresh_stale_models(&self) {
+        for pid in self.config.all_provider_ids() {
+            let stale = self.discovered.cache_age(&pid).map(|a| a > models::CACHE_TTL_SECS).unwrap_or(true);
+            if !stale {
+                continue;
+            }
+            // Only touch endpoints we can actually query.
+            if self.discovery_target(&pid).is_some() {
+                self.refresh_provider(&pid);
+            }
+        }
     }
 
     pub fn set_theme(&mut self, name: &str) {

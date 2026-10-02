@@ -88,7 +88,6 @@ pub fn all_commands() -> Vec<(&'static str, &'static str)> {
         ("/compact", "compact context — /compact [keep=20] | /compact auto on|off"),
         ("/clear", "clear screen (same as /new)"),
         ("/model", "pick provider/model — /model [provider/model]"),
-        ("/models", "same as /model"),
         ("/login", "save API key — /login [provider]"),
         ("/logout", "remove saved key — /logout <provider>"),
         ("/tools", "list available tools"),
@@ -143,12 +142,9 @@ pub fn provider_entries(app: &App, filter: &str) -> Vec<(String, bool, String)> 
     out
 }
 
-/// Returns the filter text if buffer is in `/model` picker mode
-/// (either `/model ` or `/models ` prefix).
+/// Returns the filter text if buffer is in `/model` picker mode.
 pub fn model_filter(buffer: &str) -> Option<&str> {
-    buffer
-        .strip_prefix("/model ")
-        .or_else(|| buffer.strip_prefix("/models "))
+    buffer.strip_prefix("/model ")
 }
 
 /// Display label for a (provider, model) pair. Some catalog ids are already
@@ -166,12 +162,26 @@ pub fn model_label(provider: &str, model: &str) -> String {
 pub fn model_entries(app: &App, filter: &str) -> Vec<(String, String, bool)> {
     let q = filter.trim().to_lowercase();
     let mut out = Vec::new();
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut push = |pid: &str, m: &str, ready: bool, out: &mut Vec<(String, String, bool)>| {
+        let key = (pid.to_string(), m.to_lowercase());
+        if seen.insert(key) {
+            out.push((pid.to_string(), m.to_string(), ready));
+        }
+    };
     for pid in app.config.all_provider_ids() {
+        let ready = !crate::auth::resolve_api_key(&pid, &app.auth, &app.config).0.is_empty();
+        // Live-discovered ids first (verified against the real endpoint),
+        // then the built-in catalog as offline fallback.
+        for m in app.discovered.get(&pid) {
+            if q.is_empty() || pid.contains(&q) || m.to_lowercase().contains(&q) {
+                push(&pid, &m, ready, &mut out);
+            }
+        }
         let rpc = app.config.resolve_provider_config(&pid);
         for m in &rpc.models {
             if q.is_empty() || pid.contains(&q) || m.to_lowercase().contains(&q) {
-                let ready = !crate::auth::resolve_api_key(&pid, &app.auth, &app.config).0.is_empty();
-                out.push((pid.clone(), m.clone(), ready));
+                push(&pid, m, ready, &mut out);
             }
         }
         // Free-form fallback: typed `provider/model` for a known provider
@@ -245,6 +255,8 @@ fn handle_login_key(app: &mut App, key: crossterm::event::KeyEvent) -> Result<()
                     // The point of /login is to USE the provider: switch to it
                     // right away so no separate `/model <provider>` is needed.
                     let def = app.config.resolve_default_model(&pid);
+                    // Refresh the live model list now that we have a key.
+                    app.refresh_provider(&pid);
                     match app.apply_provider_model(&pid, &def) {
                         Ok(_) => {
                             app.notice = Some(format!("saved key + switched to '{}/{}'", pid, def));
@@ -299,6 +311,11 @@ fn bare_enter(buffer: &str, palette_idx: usize, navigated: bool) -> Option<BareE
         }
         let (name, _) = items[palette_idx % items.len()];
         return Some(BareEnter::Complete(format!("{} ", name)));
+    }
+    // Bare `/model` opens its picker (highlight = active model) instead of
+    // dumping a static list — symmetric with `/login`.
+    if buffer.trim() == "/model" {
+        return Some(BareEnter::Complete("/model ".into()));
     }
     let trimmed = buffer.trim();
     if all_commands().iter().any(|(n, _)| *n == trimmed) {
@@ -708,13 +725,23 @@ pub fn handle_events(app: &mut App) -> Result<()> {
             }
             KeyCode::Enter => {
                 // Bare `/xxx`: exact command runs, highlight completes,
-                // bare `/login` opens the provider picker.
+                // bare `/login`/`/model` open their pickers.
                 match bare_enter(&app.input.buffer, app.palette_idx, app.palette_navigated) {
                     Some(BareEnter::Complete(text)) => {
-                        app.input.buffer = text;
+                        app.input.buffer = text.clone();
                         app.input.cursor_pos = app.input.buffer.len();
                         app.palette_idx = 0;
                         app.palette_navigated = false;
+                        if text == "/model " {
+                            // Preselect the active model (highlight only).
+                            let items = model_entries(app, "");
+                            if let Some(pos) = items
+                                .iter()
+                                .position(|(p, m, _)| p == &app.provider_name && m == &app.current_model)
+                            {
+                                app.model_idx = pos;
+                            }
+                        }
                         return Ok(());
                     }
                     Some(BareEnter::Submit) | None => {}
@@ -810,7 +837,7 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
             app.status.tool_status = "idle".into();
             return Ok(true);
         }
-        "/model" | "/models" => {
+        "/model" => {
             if arg.is_empty() {
                 let mut out = format!(
                     "**Provider:** `{}`\n**Model:** `{}`\n**Key:** {} ({})\n\n**Ready models:**\n",
@@ -1313,6 +1340,26 @@ mod tests {
     }
 
     #[test]
+    fn discovered_models_merge_first_without_dupes() {
+        let app = test_app();
+        // Inject discovery results via temp-HOME cache file path (isolated).
+        let tmp = std::env::temp_dir().join(format!("barong-model-repro-{}", std::process::id()));
+        let orig = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &tmp);
+        app.discovered.put("nvidia", vec!["openai/gpt-oss-20b".into(), "live/custom-1".into()]);
+        match orig {
+            Some(o) => std::env::set_var("HOME", o),
+            None => std::env::remove_var("HOME"),
+        }
+        let items = model_entries(&app, "gpt-oss");
+        assert_eq!(items.len(), 1, "live + catalog dupe must collapse, got: {:?}", items);
+        assert_eq!(items[0].1, "openai/gpt-oss-20b");
+        let live = model_entries(&app, "live/custom");
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0], ("nvidia".to_string(), "live/custom-1".to_string(), false));
+    }
+
+    #[test]
     fn provider_switch_updates_status_and_endpoint() {
         let mut app = test_app();
         app.auth.set("nvidia", "nvapi-test-key");
@@ -1350,8 +1397,15 @@ mod tests {
         // `/log` is a substring of /login and /logout, yet exact text must run.
         assert_eq!(bare_enter("/log", 0, false), Some(BareEnter::Submit));
         assert_eq!(bare_enter("/tree", 0, false), Some(BareEnter::Submit));
-        assert_eq!(bare_enter("/model", 0, false), Some(BareEnter::Submit));
         assert_eq!(bare_enter("/quit", 0, false), Some(BareEnter::Submit));
+    }
+
+    #[test]
+    fn bare_enter_model_and_login_open_pickers() {
+        assert_eq!(bare_enter("/model", 0, false), Some(BareEnter::Complete("/model ".into())));
+        assert_eq!(bare_enter("/login", 0, false), Some(BareEnter::Complete("/login ".into())));
+        // Removed `/models` alias: unknown text falls through.
+        assert_eq!(bare_enter("/models", 0, false), None);
     }
 
     #[test]
@@ -1412,12 +1466,14 @@ mod tests {
     }
 
     #[test]
-    fn models_alias_behaves_like_model() {
+    fn models_alias_is_gone_unknown_command() {
         let mut app = test_app();
         app.auth.set("nvidia", "nvapi-test-key");
         handle_slash(&mut app, "/models nvidia").unwrap();
-        assert_eq!(app.provider_name, "nvidia");
-        assert_eq!(app.current_model, "openai/gpt-oss-20b");
+        // Alias removed: provider must NOT switch.
+        assert_eq!(app.provider_name, "openai");
+        let last = app.conversation.messages.last().and_then(|m| m.content.clone()).unwrap_or_default();
+        assert!(last.contains("Unknown command"), "got: {}", last);
     }
 
     #[test]
