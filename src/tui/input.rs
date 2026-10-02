@@ -125,6 +125,23 @@ fn handle_permission_key(app: &mut App, code: crossterm::event::KeyCode) -> Resu
     return Ok(());
 }
 
+/// One entry in the `/login` picker: (provider, key-ready, base_url).
+pub fn provider_entries(app: &App, filter: &str) -> Vec<(String, bool, String)> {
+    let q = filter.trim().to_lowercase();
+    let mut out = Vec::new();
+    for pid in app.config.all_provider_ids() {
+        if q.is_empty() || pid.contains(&q) {
+            let (key, _) = crate::auth::resolve_api_key(&pid, &app.auth, &app.config);
+            let rpc = app.config.resolve_provider_config(&pid);
+            out.push((pid.clone(), !key.is_empty(), rpc.base_url.clone()));
+        }
+    }
+    // Ready providers first, then alphabetical.
+    out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    out.truncate(12);
+    out
+}
+
 /// One entry in the `/model` picker: (provider, model, key-ready).
 pub fn model_entries(app: &App, filter: &str) -> Vec<(String, String, bool)> {
     let q = filter.trim().to_lowercase();
@@ -487,6 +504,8 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                 app.palette_idx = 0;
                 app.model_idx = 0;
                 app.model_navigated = false;
+                app.login_idx = 0;
+                app.login_navigated = false;
             }
             KeyCode::Backspace => {
                 if app.input.cursor_pos > 0 && !app.input.buffer.is_empty() {
@@ -503,6 +522,8 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                 app.palette_idx = 0;
                 app.model_idx = 0;
                 app.model_navigated = false;
+                app.login_idx = 0;
+                app.login_navigated = false;
             }
             KeyCode::Delete => {
                 if app.input.cursor_pos < app.input.buffer.len() {
@@ -529,6 +550,15 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                     }
                     return Ok(());
                 }
+                if app.input.buffer.starts_with("/login ") {
+                    let filter = app.input.buffer["/login ".len()..].to_string();
+                    let items = provider_entries(app, &filter);
+                    if !items.is_empty() {
+                        app.login_idx = (app.login_idx + items.len() - 1) % items.len();
+                        app.login_navigated = true;
+                    }
+                    return Ok(());
+                }
                 if app.input.buffer.starts_with('/') {
                     let items = command_palette(&app.input.buffer);
                     if !items.is_empty() {
@@ -545,6 +575,15 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                     if !items.is_empty() {
                         app.model_idx = (app.model_idx + 1) % items.len();
                         app.model_navigated = true;
+                    }
+                    return Ok(());
+                }
+                if app.input.buffer.starts_with("/login ") {
+                    let filter = app.input.buffer["/login ".len()..].to_string();
+                    let items = provider_entries(app, &filter);
+                    if !items.is_empty() {
+                        app.login_idx = (app.login_idx + 1) % items.len();
+                        app.login_navigated = true;
                     }
                     return Ok(());
                 }
@@ -568,6 +607,16 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                         app.input.cursor_pos = app.input.buffer.len();
                         app.model_idx = 0;
                         app.model_navigated = false;
+                    }
+                } else if app.input.buffer.starts_with("/login ") {
+                    let filter = app.input.buffer["/login ".len()..].to_string();
+                    let items = provider_entries(app, &filter);
+                    if !items.is_empty() {
+                        let idx = app.login_idx % items.len();
+                        app.input.buffer = format!("/login {} ", items[idx].0);
+                        app.input.cursor_pos = app.input.buffer.len();
+                        app.login_idx = 0;
+                        app.login_navigated = false;
                     }
                 } else if app.input.buffer.starts_with('/') {
                     complete_palette(app);
@@ -744,7 +793,20 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
             return Ok(true);
         }
         "/login" => {
-            if arg.is_empty() {
+            if app.login_navigated {
+                // Enter after arrow-key navigation: use highlighted picker entry.
+                let items = provider_entries(app, arg);
+                if items.is_empty() {
+                    app.notice = Some("no matching providers".into());
+                } else if let Some(sel) = items.get(app.login_idx % items.len()) {
+                    let pid = sel.0.clone();
+                    app.pending_login = Some(pid.clone());
+                    app.login_buffer.clear();
+                    app.notice = Some(format!("paste API key for '{}' — Enter saves, Esc cancels", pid));
+                }
+                app.login_navigated = false;
+                app.login_idx = 0;
+            } else if arg.is_empty() {
                 let mut out = String::from("**Providers:**\n");
                 for pid in app.config.all_provider_ids() {
                     let (key, src) = crate::auth::resolve_api_key(&pid, &app.auth, &app.config);

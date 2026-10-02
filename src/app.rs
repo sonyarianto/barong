@@ -53,6 +53,8 @@ pub struct App {
     pub login_buffer: String,
     pub model_idx: usize,
     pub model_navigated: bool,
+    pub login_idx: usize,
+    pub login_navigated: bool,
 }
 
 impl App {
@@ -145,6 +147,8 @@ impl App {
             login_buffer: String::new(),
             model_idx: 0,
             model_navigated: false,
+            login_idx: 0,
+            login_navigated: false,
         }
     }
 

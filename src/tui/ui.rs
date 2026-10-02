@@ -27,10 +27,13 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         render_chat(frame, chunks[0], app);
     }
     render_input(frame, chunks[1], app);
-    // pickers overlay above input (model picker takes over command palette)
+    // pickers overlay above input (model/login pickers take over command palette)
     let model_mode = app.input.buffer.starts_with("/model ");
+    let login_mode = app.input.buffer.starts_with("/login ");
     if model_mode && app.event_rx.is_none() && app.pending_approval.is_none() && app.pending_login.is_none() {
         render_model_picker(frame, chunks[0], chunks[1], app);
+    } else if login_mode && app.event_rx.is_none() && app.pending_approval.is_none() && app.pending_login.is_none() {
+        render_login_picker(frame, chunks[0], chunks[1], app);
     } else if app.input.buffer.starts_with('/') && app.event_rx.is_none() && app.pending_approval.is_none() && app.pending_login.is_none() {
         render_palette(frame, chunks[0], chunks[1], app);
     }
@@ -360,6 +363,51 @@ fn render_model_picker(frame: &mut Frame, chat: Rect, input: Rect, app: &App) {
         .borders(Borders::ALL)
         .border_type(ratatui::widgets::BorderType::Rounded)
         .title(format!(" model {}/{} — ● key ready ", selected + 1, items.len()))
+        .border_style(Style::default().fg(app.theme.muted));
+    frame.render_widget(List::new(list_items).block(block), area);
+}
+
+fn render_login_picker(frame: &mut Frame, chat: Rect, input: Rect, app: &App) {
+    let filter = app.input.buffer["/login ".len()..].to_string();
+    let items = crate::tui::input::provider_entries(app, &filter);
+    if items.is_empty() {
+        return;
+    }
+    let visible = items.len().min(8);
+    let selected = app.login_idx % items.len();
+    let max_start = items.len().saturating_sub(visible);
+    let start = (selected.saturating_sub(visible.saturating_sub(1))).min(max_start);
+    let end = (start + visible).min(items.len());
+    let height = (visible + 2) as u16;
+    let width = input.width.min(64);
+    let x = input.x;
+    let y = input.y.saturating_sub(height);
+    let area = Rect::new(x, y, width, height);
+    let _ = chat;
+    frame.render_widget(Clear, area);
+    let list_items: Vec<ListItem> = items[start..end]
+        .iter()
+        .enumerate()
+        .map(|(i, (pid, ready, base))| {
+            let style = if start + i == selected {
+                Style::default().fg(Color::Black).bg(app.theme.accent)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let dot = if *ready { "●" } else { "○" };
+            let dot_color = if *ready { app.theme.success } else { app.theme.muted };
+            let endpoint = if base.is_empty() { "(default endpoint)".to_string() } else { truncate(base, 30) };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!(" {} ", dot), Style::default().fg(dot_color)),
+                Span::styled(format!("{:<10}", pid), style),
+                Span::styled(format!(" {}", endpoint), Style::default().fg(app.theme.muted)),
+            ]))
+        })
+        .collect();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .title(format!(" login {}/{} — ● key saved ", selected + 1, items.len()))
         .border_style(Style::default().fg(app.theme.muted));
     frame.render_widget(List::new(list_items).block(block), area);
 }
