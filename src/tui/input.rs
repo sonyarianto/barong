@@ -151,6 +151,17 @@ pub fn model_filter(buffer: &str) -> Option<&str> {
         .or_else(|| buffer.strip_prefix("/models "))
 }
 
+/// Display label for a (provider, model) pair. Some catalog ids are already
+/// namespaced (`nvidia/llama-3.1-...`); don't double the prefix on screen.
+pub fn model_label(provider: &str, model: &str) -> String {
+    let p = provider.trim().to_lowercase();
+    if model.to_lowercase().starts_with(&format!("{}/", p)) {
+        model.to_string()
+    } else {
+        format!("{}/{}", provider, model)
+    }
+}
+
 /// One entry in the `/model` picker: (provider, model, key-ready).
 pub fn model_entries(app: &App, filter: &str) -> Vec<(String, String, bool)> {
     let q = filter.trim().to_lowercase();
@@ -165,7 +176,10 @@ pub fn model_entries(app: &App, filter: &str) -> Vec<(String, String, bool)> {
         }
         // Free-form fallback: typed `provider/model` for a known provider
         // whose catalog doesn't list it (e.g. new OpenRouter ids).
-        if !q.is_empty() && q.starts_with(&format!("{}/", pid)) && q.len() > pid.len() + 1 {
+        // Skipped when the full filter already names a catalog model exactly:
+        // otherwise the short form shadows it and a bogus id can win.
+        let exact_catalog_hit = rpc.models.iter().any(|m| m.eq_ignore_ascii_case(filter.trim()));
+        if !exact_catalog_hit && !q.is_empty() && q.starts_with(&format!("{}/", pid)) && q.len() > pid.len() + 1 {
             let custom = filter.trim().to_string();
             let custom = custom[pid.len() + 1..].trim().to_string();
             if !custom.is_empty() && !rpc.models.iter().any(|m| m.eq_ignore_ascii_case(&custom)) {
@@ -222,17 +236,16 @@ fn handle_login_key(app: &mut App, key: crossterm::event::KeyEvent) -> Result<()
                     app.notice = Some("empty key — login cancelled".into());
                 } else {
                     app.auth.set(&pid, entered.trim());
-                    // Re-resolve in case this is the active provider.
-                    let (k, src) = crate::auth::resolve_api_key(&app.provider_name, &app.auth, &app.config);
-                    app.key_source = src;
-                    if k.is_empty() {
-                        app.notice = Some(format!("saved key for '{}'", pid));
-                    } else {
-                        app.notice = Some(format!("saved key for '{}' ({})", pid, src));
+                    // Refresh active-provider key status only when we just
+                    // saved a key for it; otherwise leave it alone.
+                    if pid == app.provider_name {
+                        let (_, src) = crate::auth::resolve_api_key(&pid, &app.auth, &app.config);
+                        app.key_source = src;
                     }
+                    app.notice = Some(format!("saved key for '{}'", pid));
                     app.conversation.add_message(
                         "assistant".into(),
-                        format!("API key saved for `{}` ({}). Try `/model {}/…`.", pid, src, pid),
+                        format!("API key saved for `{}`. Try `/model {}`.", pid, pid),
                     );
                     app.save_session();
                     app.is_home = false;
@@ -609,7 +622,7 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                     if !items.is_empty() {
                         let idx = app.model_idx % items.len();
                         let (p, m, _) = &items[idx];
-                        app.input.buffer = format!("/model {}/{} ", p, m);
+                        app.input.buffer = format!("/model {} ", model_label(p, m));
                         app.input.cursor_pos = app.input.buffer.len();
                         app.model_idx = 0;
                         app.model_navigated = false;
@@ -747,7 +760,7 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
                     app.provider_name, app.current_model, if app.api_key().is_empty() { "missing" } else { "set" }, app.key_source,
                 );
                 for (p, m, ready) in model_entries(app, "").iter().take(12) {
-                    out.push_str(&format!("- {} `{}/{}`\n", if *ready { "●" } else { "○" }, p, m));
+                    out.push_str(&format!("- {} `{}`\n", if *ready { "●" } else { "○" }, model_label(p, m)));
                 }
                 out.push_str("\nUsage: `/model <provider/model>` or `/model <text>` + ↑↓ + Enter\n`○` = no key yet — `/login <provider>`");
                 app.conversation.add_message("assistant".into(), out);
@@ -762,7 +775,7 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
                     match app.apply_provider_model(&p, &m) {
                         Ok(_) => {
                             let warn = if !ready { " (no key yet — `/login` to activate)".to_string() } else { String::new() };
-                            app.conversation.add_message("assistant".into(), format!("**Model set to:** `{}/{}`{}", p, m, warn));
+                            app.conversation.add_message("assistant".into(), format!("**Model set to:** `{}`{}", model_label(&p, &m), warn));
                         }
                         Err(e) => app.conversation.add_message("assistant".into(), e),
                     }
@@ -799,25 +812,25 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
                 if let Some((ep, em, _)) = hit {
                     let (ep, em) = (ep.clone(), em.clone());
                     match app.apply_provider_model(&ep, &em) {
-                        Ok(_) => app.conversation.add_message("assistant".into(), format!("**Model set to:** `{}/{}`", ep, em)),
+                        Ok(_) => app.conversation.add_message("assistant".into(), format!("**Model set to:** `{}`", model_label(&ep, &em))),
                         Err(e) => app.conversation.add_message("assistant".into(), e),
                     }
                 } else if items.len() == 1 {
                     let (ep, em, _) = items[0].clone();
                     match app.apply_provider_model(&ep, &em) {
-                        Ok(_) => app.conversation.add_message("assistant".into(), format!("**Model set to:** `{}/{}`", ep, em)),
+                        Ok(_) => app.conversation.add_message("assistant".into(), format!("**Model set to:** `{}`", model_label(&ep, &em))),
                         Err(e) => app.conversation.add_message("assistant".into(), e),
                     }
                 } else if items.is_empty() {
                     // Free-form `provider/model` (e.g. brand-new OpenRouter id).
                     match app.apply_provider_model(&p, &m) {
-                        Ok(_) => app.conversation.add_message("assistant".into(), format!("**Model set to:** `{}/{}`\n_custom id — verify it exists on the provider._", p, m)),
+                        Ok(_) => app.conversation.add_message("assistant".into(), format!("**Model set to:** `{}`\n_custom id — verify it exists on the provider._", model_label(&p, &m))),
                         Err(e) => app.conversation.add_message("assistant".into(), e),
                     }
                 } else {
                     let mut out = format!("**{} matches** — refine or ↑↓ + Enter:\n", items.len());
                     for (ep, em, ready) in items.iter().take(10) {
-                        out.push_str(&format!("- {} `{}/{}`\n", if *ready { "●" } else { "○" }, ep, em));
+                        out.push_str(&format!("- {} `{}`\n", if *ready { "●" } else { "○" }, model_label(ep, em)));
                     }
                     app.conversation.add_message("assistant".into(), out);
                 }
@@ -1207,6 +1220,46 @@ mod tests {
         let f = provider_entries(&app, "deep");
         assert!(!f.is_empty());
         assert!(f.iter().all(|(p, _, _)| p.contains("deep")));
+    }
+
+    #[test]
+    fn login_message_reports_saved_provider_not_active() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = test_app();
+        // Active provider is openai (no key); we save a key for nvidia.
+        app.pending_login = Some("nvidia".into());
+        for c in "nvapi-test-key".chars() {
+            let ev = KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty());
+            super::handle_login_key(&mut app, ev).unwrap();
+        }
+        // Simulate Enter via the real handler.
+        let ev = KeyEvent::new(KeyCode::Enter, KeyModifiers::empty());
+        super::handle_login_key(&mut app, ev).unwrap();
+        assert_eq!(app.auth.get("nvidia").as_deref(), Some("nvapi-test-key"));
+        let last = app.conversation.messages.last().and_then(|m| m.content.clone()).unwrap_or_default();
+        assert!(last.contains("API key saved for `nvidia`"), "got: {}", last);
+        assert!(!last.contains("missing"), "must not report active-provider status, got: {}", last);
+    }
+
+    #[test]
+    fn model_single_form_label_applies_full_id() {
+        // Display shows `nvidia/llama-3.1-nemotron-70b-instruct` (no doubling);
+        // pasting it back must apply the full catalog id, not dump matches.
+        let mut app = test_app();
+        app.auth.set("nvidia", "nvapi-test-key");
+        handle_slash(&mut app, "/model nvidia/llama-3.1-nemotron-70b-instruct").unwrap();
+        assert_eq!(app.provider_name, "nvidia");
+        assert_eq!(app.current_model, "nvidia/llama-3.1-nemotron-70b-instruct");
+    }
+
+    #[test]
+    fn model_doubled_form_still_applies() {
+        // Old doubled display `nvidia/nvidia/...` (copy-paste) must keep working.
+        let mut app = test_app();
+        app.auth.set("nvidia", "nvapi-test-key");
+        handle_slash(&mut app, "/model nvidia/nvidia/llama-3.1-nemotron-70b-instruct").unwrap();
+        assert_eq!(app.provider_name, "nvidia");
+        assert_eq!(app.current_model, "nvidia/llama-3.1-nemotron-70b-instruct");
     }
 
     #[test]

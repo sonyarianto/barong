@@ -355,7 +355,7 @@ fn render_model_picker(frame: &mut Frame, chat: Rect, input: Rect, app: &App) {
             ListItem::new(Line::from(vec![
                 Span::styled(format!(" {} ", dot), Style::default().fg(dot_color)),
                 Span::styled(format!("{:<10}", p), style),
-                Span::styled(format!(" {}", truncate(m, 34)), Style::default().fg(app.theme.muted)),
+                Span::styled(format!(" {}", truncate(&crate::tui::input::model_label(p, m), 34)), Style::default().fg(app.theme.muted)),
             ]))
         })
         .collect();
