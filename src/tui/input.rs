@@ -634,7 +634,14 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                 }
             }
             KeyCode::Enter => {
-                // first Enter on bare `/xx` completes palette instead of submitting
+                // Bare `/login` opens the interactive provider picker.
+                if app.input.buffer.trim() == "/login" {
+                    app.input.buffer = "/login ".to_string();
+                    app.input.cursor_pos = app.input.buffer.len();
+                    app.login_idx = 0;
+                    app.login_navigated = false;
+                    return Ok(());
+                }
                 if app.input.buffer.starts_with('/') && !app.input.buffer.contains(' ') && !app.input.buffer.contains('\n') {
                     let items = command_palette(&app.input.buffer);
                     if items.len() == 1 || (app.palette_idx == 0 && !items.is_empty() && format!("/{}", app.input.buffer.trim_start_matches('/').split_whitespace().next().unwrap_or("")) != items[0].0) {
@@ -1181,6 +1188,25 @@ mod tests {
         handle_slash(&mut app, "/model deepseek-ai/deepseek-r1").unwrap();
         assert_eq!(app.provider_name, "nvidia");
         assert_eq!(app.current_model, "deepseek-ai/deepseek-r1");
+    }
+
+    #[test]
+    fn login_picker_lists_providers_with_key_status() {
+        let mut app = test_app();
+        // No keys: all present; only keyless ollama is ready.
+        let all = provider_entries(&app, "");
+        assert!(all.iter().any(|(p, _, _)| p == "nvidia"));
+        assert!(all.iter().any(|(p, _, _)| p == "openrouter"));
+        assert!(all.iter().filter(|(p, _, _)| p != "ollama").all(|(_, ready, _)| !ready));
+        // After login: nvidia sorts first with ready=true.
+        app.auth.set("nvidia", "nvapi-test-key");
+        let all = provider_entries(&app, "");
+        assert_eq!(all[0].0, "nvidia");
+        assert!(all[0].1);
+        // Filter narrows.
+        let f = provider_entries(&app, "deep");
+        assert!(!f.is_empty());
+        assert!(f.iter().all(|(p, _, _)| p.contains("deep")));
     }
 
     #[test]
