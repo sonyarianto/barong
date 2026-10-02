@@ -108,7 +108,7 @@ fn render_chat(frame: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
-    let md = crate::tui::markdown::MarkdownRenderer::with_code_theme(app.theme.code_theme);
+    let md = crate::tui::markdown::MarkdownRenderer::with_theme(&app.theme);
     let mut all_lines: Vec<Line> = Vec::new();
 
     for msg in &app.conversation.messages {
