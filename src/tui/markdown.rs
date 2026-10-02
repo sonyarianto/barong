@@ -261,66 +261,98 @@ impl MarkdownRenderer {
         *in_table = false;
         let rows = std::mem::take(table_lines);
 
-        // Determine column widths
+        let split_row = |row: &str| -> Vec<String> {
+            row.split('|')
+                .map(|c| c.trim().to_string())
+                .filter(|c| !c.is_empty())
+                .collect()
+        };
+        let is_sep_row =
+            |cells: &[String]| !cells.is_empty() && cells.iter().all(|c| c.chars().all(|ch| ch == '-' || ch == ':'));
+
+        // Column widths from RENDERED width (inline markup stripped first so
+        // backticks don't inflate padding).
+        let plain = |cell: &str| -> String {
+            self.parse_inline(cell)
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect()
+        };
         let mut col_widths: Vec<usize> = Vec::new();
         for row in &rows {
-            let cells: Vec<&str> = row
-                .split('|')
-                .filter(|c| !c.is_empty())
-                .collect();
+            let cells = split_row(row);
+            if is_sep_row(&cells) {
+                continue;
+            }
             for (i, cell) in cells.iter().enumerate() {
-                let clean = cell.trim();
+                let w = display_width(&plain(cell));
                 if i >= col_widths.len() {
-                    col_widths.push(clean.len());
+                    col_widths.push(w);
                 } else {
-                    col_widths[i] = col_widths[i].max(clean.len());
+                    col_widths[i] = col_widths[i].max(w);
                 }
             }
         }
+        if col_widths.is_empty() {
+            return;
+        }
 
-        let table_style = Style::default().fg(self.accent);
         let sep_style = Style::default().fg(self.muted);
         let header_style = Style::default()
             .fg(self.accent)
             .add_modifier(Modifier::BOLD);
-
-        for (row_idx, row) in rows.iter().enumerate() {
-            let cells: Vec<&str> = row
-                .split('|')
-                .filter(|c| !c.is_empty())
-                .collect();
-
+        let rule = |left: &'a str, joint: &'a str, right: &'a str| -> Line<'a> {
             let mut spans = vec![prefix.clone()];
-
-            // Detect separator row (|---|)
-            if row.trim().chars().all(|c| c == '|' || c == '-' || c == ':') {
-                spans.push(Span::styled("├─", sep_style));
-                for (i, w) in col_widths.iter().enumerate() {
-                    let sep = "─".repeat(*w);
-                    spans.push(Span::styled(sep, sep_style));
-                    if i < col_widths.len() - 1 {
-                        spans.push(Span::styled("─┼─", sep_style));
-                    }
+            spans.push(Span::styled(left, sep_style));
+            for (i, w) in col_widths.iter().enumerate() {
+                spans.push(Span::styled("─".repeat(*w + 2), sep_style));
+                if i < col_widths.len() - 1 {
+                    spans.push(Span::styled(joint, sep_style));
                 }
-                spans.push(Span::styled("─┤", sep_style));
-                lines.push(Line::from(spans));
+            }
+            spans.push(Span::styled(right, sep_style));
+            Line::from(spans)
+        };
+
+        lines.push(rule("┌", "┬", "┐"));
+        let ncols = col_widths.len();
+        let mut first_content = true;
+        for row in &rows {
+            let cells = split_row(row);
+            // Source `|---|` row becomes the pretty separator (not shown raw).
+            if is_sep_row(&cells) {
+                lines.push(rule("├", "┼", "┤"));
                 continue;
             }
-
-            let style = if row_idx == 0 { header_style } else { table_style };
-            spans.push(Span::styled("│ ", style));
-            for (i, cell) in cells.iter().enumerate() {
-                let clean = cell.trim();
-                let w = col_widths.get(i).copied().unwrap_or(clean.len());
-                let padded = format!("{:<width$}", clean, width = w);
-                spans.push(Span::styled(padded, style));
-                if i < col_widths.len() - 1 {
-                    spans.push(Span::styled(" │ ", style));
+            let header = first_content;
+            first_content = false;
+            let mut spans = vec![prefix.clone()];
+            spans.push(Span::styled("│ ", sep_style));
+            for i in 0..ncols {
+                let cell = cells.get(i).map(|s| s.as_str()).unwrap_or("");
+                if header {
+                    let text = plain(cell);
+                    let pad = col_widths[i].saturating_sub(display_width(&text));
+                    spans.push(Span::styled(text, header_style));
+                    spans.push(Span::styled(" ".repeat(pad), header_style));
+                } else {
+                    // Owned copies: cell borrows die with this loop iteration,
+                    // but the line outlives it.
+                    let cell_spans = self.parse_inline(cell);
+                    let w: usize = cell_spans.iter().map(|s| display_width(s.content.as_ref())).sum();
+                    for s in cell_spans {
+                        spans.push(Span::styled(s.content.into_owned(), s.style));
+                    }
+                    spans.push(Span::styled(" ".repeat(col_widths[i].saturating_sub(w)), Style::default()));
+                }
+                if i < ncols - 1 {
+                    spans.push(Span::styled(" │ ", sep_style));
                 }
             }
-            spans.push(Span::styled(" │", style));
+            spans.push(Span::styled(" │", sep_style));
             lines.push(Line::from(spans));
         }
+        lines.push(rule("└", "┴", "┘"));
         lines.push(Line::from(vec![
             prefix.clone(),
             Span::raw(""),
@@ -672,6 +704,36 @@ mod tests {
         let md = MarkdownRenderer::new();
         let out = flat(&md.render("well-known fact", "assistant"));
         assert_eq!(out, vec!["well-known fact".to_string()]);
+    }
+
+    #[test]
+    fn table_gets_box_body_stays_default() {
+        use ratatui::style::{Color, Modifier};
+        let md = MarkdownRenderer::new();
+        let text = "| Baris | Penjelasan |\n|---|---|\n| `WriteLn('...');` | Menampilkan teks. |";
+        let rendered = md.render(text, "assistant");
+        let out = flat(&rendered);
+        // top rule, header, sep, body, bottom rule, breathing room
+        assert_eq!(out.len(), 6, "got: {:?}", out);
+        assert!(out[0].starts_with("┌") && out[0].ends_with('┐'), "top, got: {}", out[0]);
+        assert!(out[4].starts_with("└") && out[4].ends_with('┘'), "bottom, got: {}", out[4]);
+        assert!(out[2].contains('├'), "sep, got: {}", out[2]);
+        // header accent-bold, body default fg (no more all-yellow).
+        // spans: [prefix, "│ ", text, pad, ...]
+        let header_style = rendered[1].spans[2].style;
+        assert_eq!(header_style.fg, Some(Color::Cyan));
+        assert!(header_style.add_modifier.contains(Modifier::BOLD));
+        let body_default: String = rendered[3]
+            .spans
+            .iter()
+            .filter(|s| s.style.fg.is_none())
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(body_default.contains("Menampilkan teks."), "plain text must be default fg, got {:?}", body_default);
+        // inline code keeps its backticks (affordance) but is styled now,
+        // previously the whole cell was raw unstyled text.
+        let code_span = rendered[3].spans.iter().find(|s| s.content.contains("WriteLn")).expect("code cell");
+        assert_eq!(code_span.style.fg, Some(ratatui::style::Color::Cyan));
     }
     #[test]
     fn wide_container_rows_span_full_width() {

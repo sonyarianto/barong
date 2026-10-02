@@ -1449,15 +1449,23 @@ mod tests {
 
     /// App isolated from the real ~/.barong (unique temp HOME per call, so
     /// session-restore never leaks state between tests).
+    /// HOME is process-global: serialize the whole dance so parallel tests
+    /// can't observe each other's (or the real) home mid-swap.
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     fn test_app() -> App {
+        let _guard = HOME_LOCK.lock().unwrap();
+        test_app_locked()
+    }
+
+    /// Assumes HOME_LOCK is held.
+    fn test_app_locked() -> App {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
         let tmp = std::env::temp_dir().join(format!("barong-test-{}-{}", std::process::id(), n));
         let _ = std::fs::create_dir_all(&tmp);
         let orig = std::env::var("HOME").ok();
-        // SAFETY: only this test touches HOME, and no other test reads it
-        // concurrently (all other env use is disjoint var names).
+        // SAFETY: HOME dance holds HOME_LOCK; no other thread observes mid-swap.
         unsafe { std::env::set_var("HOME", &tmp); }
         let app = App::new_with_config(Config::default(), vec![]);
         match orig {
@@ -1536,7 +1544,8 @@ mod tests {
 
     #[test]
     fn discovered_models_merge_first_without_dupes() {
-        let app = test_app();
+        let _guard = HOME_LOCK.lock().unwrap();
+        let app = test_app_locked();
         // Inject discovery results via temp-HOME cache file path (isolated).
         let tmp = std::env::temp_dir().join(format!("barong-model-repro-{}", std::process::id()));
         let orig = std::env::var("HOME").ok();
