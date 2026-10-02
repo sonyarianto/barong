@@ -194,8 +194,14 @@ pub fn model_entries(app: &App, filter: &str) -> Vec<(String, String, bool)> {
     out
 }
 
-fn handle_login_key(app: &mut App, key: crossterm::event::KeyEvent) -> Result<()> {
-    use crossterm::event::{KeyCode, KeyModifiers};
+/// Enter key-entry mode for a provider: next keys go to the masked prompt.
+fn begin_login(app: &mut App, pid: &str) {
+    app.pending_login = Some(pid.to_string());
+    app.login_buffer.clear();
+    app.notice = Some(format!("paste API key for '{}' — Enter saves, Esc cancels", pid));
+}
+
+fn handle_login_key(app: &mut App, key: crossterm::event::KeyEvent) -> Result<()> {    use crossterm::event::{KeyCode, KeyModifiers};
     // Esc cancels outright.
     if key.code == KeyCode::Esc {
         app.pending_login = None;
@@ -262,6 +268,43 @@ fn handle_login_key(app: &mut App, key: crossterm::event::KeyEvent) -> Result<()
     return Ok(());
 }
 
+/// What bare-`/xxx` Enter should do: run the command, or complete text first.
+///
+/// Rules (predictable for every command):
+/// - arrow-navigated highlight → complete it into the buffer (never run blindly)
+/// - text exactly matching a command (`/log`) → run it immediately
+/// - strict prefix (`/lo`) → complete the first match, second Enter runs it
+/// - no match → fall through (surfaces "unknown command")
+#[derive(Debug, PartialEq)]
+enum BareEnter {
+    Submit,
+    Complete(String),
+}
+
+fn bare_enter(buffer: &str, palette_idx: usize, navigated: bool) -> Option<BareEnter> {
+    if !buffer.starts_with('/') || buffer.contains(' ') || buffer.contains('\n') {
+        return None;
+    }
+    if navigated {
+        let items = command_palette(buffer);
+        if items.is_empty() {
+            return None;
+        }
+        let (name, _) = items[palette_idx % items.len()];
+        return Some(BareEnter::Complete(format!("{} ", name)));
+    }
+    let trimmed = buffer.trim();
+    if all_commands().iter().any(|(n, _)| *n == trimmed) {
+        return Some(BareEnter::Submit);
+    }
+    let items = command_palette(buffer);
+    if items.is_empty() {
+        return None;
+    }
+    let (name, _) = items[palette_idx % items.len()];
+    Some(BareEnter::Complete(format!("{} ", name)))
+}
+
 pub fn command_palette(filter: &str) -> Vec<(&'static str, &'static str)> {
     let q = filter.trim().to_lowercase();
     let q = q.strip_prefix('/').unwrap_or(&q);
@@ -283,6 +326,7 @@ fn complete_palette(app: &mut App) {
     app.input.buffer = format!("{} ", name);
     app.input.cursor_pos = app.input.buffer.len();
     app.palette_idx = 0;
+    app.palette_navigated = false;
 }
 
 fn complete_mention(app: &mut App) {
@@ -529,6 +573,7 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                 app.input.buffer.insert(app.input.cursor_pos, c);
                 app.input.cursor_pos += 1;
                 app.palette_idx = 0;
+                app.palette_navigated = false;
                 app.model_idx = 0;
                 app.model_navigated = false;
                 app.login_idx = 0;
@@ -547,6 +592,7 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                     }
                 }
                 app.palette_idx = 0;
+                app.palette_navigated = false;
                 app.model_idx = 0;
                 app.model_navigated = false;
                 app.login_idx = 0;
@@ -589,6 +635,7 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                     let items = command_palette(&app.input.buffer);
                     if !items.is_empty() {
                         app.palette_idx = (app.palette_idx + items.len() - 1) % items.len();
+                        app.palette_navigated = true;
                         return Ok(());
                     }
                 }
@@ -616,6 +663,7 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                     let items = command_palette(&app.input.buffer);
                     if !items.is_empty() {
                         app.palette_idx = (app.palette_idx + 1) % items.len();
+                        app.palette_navigated = true;
                         return Ok(());
                     }
                 }
@@ -660,21 +708,22 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                     app.login_navigated = false;
                     return Ok(());
                 }
-                if app.input.buffer.starts_with('/') && !app.input.buffer.contains(' ') && !app.input.buffer.contains('\n') {
-                    let items = command_palette(&app.input.buffer);
-                    if items.len() == 1 || (app.palette_idx == 0 && !items.is_empty() && format!("/{}", app.input.buffer.trim_start_matches('/').split_whitespace().next().unwrap_or("")) != items[0].0) {
-                        // only auto-complete when buffer is a strict prefix, not an exact command
-                        let exact = items.iter().any(|(n, _)| format!("{} ", n) == format!("{} ", app.input.buffer.trim()));
-                        if !exact {
-                            complete_palette(app);
-                            return Ok(());
-                        }
+                // Bare `/xxx`: exact command runs, highlight completes.
+                match bare_enter(&app.input.buffer, app.palette_idx, app.palette_navigated) {
+                    Some(BareEnter::Complete(text)) => {
+                        app.input.buffer = text;
+                        app.input.cursor_pos = app.input.buffer.len();
+                        app.palette_idx = 0;
+                        app.palette_navigated = false;
+                        return Ok(());
                     }
+                    Some(BareEnter::Submit) | None => {}
                 }
                 let input = std::mem::take(&mut app.input.buffer);
                 app.input.cursor_pos = 0;
                 app.input.history_index = None;
                 app.palette_idx = 0;
+                app.palette_navigated = false;
                 if input.trim().is_empty() || app.event_rx.is_some() {
                     return Ok(());
                 }
@@ -709,6 +758,9 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                 } else if app.input.buffer.starts_with('/') {
                     app.input.buffer.clear();
                     app.input.cursor_pos = 0;
+                    app.palette_navigated = false;
+                    app.model_navigated = false;
+                    app.login_navigated = false;
                 }
             }
             KeyCode::PageUp => {
@@ -853,10 +905,7 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
                 if items.is_empty() {
                     app.notice = Some("no matching providers".into());
                 } else if let Some(sel) = items.get(app.login_idx % items.len()) {
-                    let pid = sel.0.clone();
-                    app.pending_login = Some(pid.clone());
-                    app.login_buffer.clear();
-                    app.notice = Some(format!("paste API key for '{}' — Enter saves, Esc cancels", pid));
+                    begin_login(app, &sel.0.clone());
                 }
                 app.login_navigated = false;
                 app.login_idx = 0;
@@ -880,14 +929,24 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
                     }
                 }
             } else {
-                let pid = arg.split_whitespace().next().unwrap_or("").to_lowercase();
-                let rpc = app.config.resolve_provider_config(&pid);
-                if !rpc.known {
-                    app.conversation.add_message("assistant".into(), format!("Unknown provider `{}`. Known: {}.\nCustom OpenAI-compatible endpoints go in `barong.jsonc` under `providers`.", pid, app.config.all_provider_ids().join(", ")));
+                let word = arg.split_whitespace().next().unwrap_or("");
+                // Exact id first, else single fuzzy match (mirror /model).
+                let ids = app.config.all_provider_ids();
+                if let Some(pid) = ids.iter().find(|id| id.eq_ignore_ascii_case(word)).cloned() {
+                    begin_login(app, &pid);
                 } else {
-                    app.pending_login = Some(pid.clone());
-                    app.login_buffer.clear();
-                    app.notice = Some(format!("paste API key for '{}' — Enter saves, Esc cancels", pid));
+                    let items = provider_entries(app, word);
+                    if items.len() == 1 {
+                        begin_login(app, &items[0].0.clone());
+                    } else if items.is_empty() {
+                        app.conversation.add_message("assistant".into(), format!("Unknown provider `{}`. Known: {}.\nCustom OpenAI-compatible endpoints go in `barong.jsonc` under `providers`.", word, ids.join(", ")));
+                    } else {
+                        let mut out = format!("**{} matches** — refine or ↑↓ + Enter:\n", items.len());
+                        for (pid, ready, _) in items.iter().take(8) {
+                            out.push_str(&format!("- {} `{}`\n", if *ready { "●" } else { "○" }, pid));
+                        }
+                        app.conversation.add_message("assistant".into(), out);
+                    }
                 }
             }
             app.save_session();
@@ -1235,6 +1294,25 @@ mod tests {
     }
 
     #[test]
+    fn login_partial_name_fuzzy_matches_single() {
+        let mut app = test_app();
+        handle_slash(&mut app, "/login nvid").unwrap();
+        assert_eq!(app.pending_login.as_deref(), Some("nvidia"));
+    }
+
+    #[test]
+    fn provider_switch_updates_status_and_endpoint() {
+        let mut app = test_app();
+        app.auth.set("nvidia", "nvapi-test-key");
+        handle_slash(&mut app, "/model nvidia").unwrap();
+        assert_eq!(app.status.llm_provider, "openai"); // nvidia speaks OpenAI API
+        let ep = app.endpoint.lock().unwrap();
+        assert_eq!(ep.model, "deepseek-ai/deepseek-r1");
+        assert_eq!(ep.api_key, "nvapi-test-key");
+        assert_eq!(ep.base_url, "https://integrate.api.nvidia.com/v1");
+    }
+
+    #[test]
     fn login_save_auto_switches_to_provider() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut app = test_app();
@@ -1253,6 +1331,35 @@ mod tests {
         assert_eq!(app.current_model, "deepseek-ai/deepseek-r1");
         let last = app.conversation.messages.last().and_then(|m| m.content.clone()).unwrap_or_default();
         assert!(last.contains("Switched to `nvidia/deepseek-ai/deepseek-r1`"), "got: {}", last);
+    }
+
+    #[test]
+    fn bare_enter_exact_command_submits() {
+        // `/log` is a substring of /login and /logout, yet exact text must run.
+        assert_eq!(bare_enter("/log", 0, false), Some(BareEnter::Submit));
+        assert_eq!(bare_enter("/tree", 0, false), Some(BareEnter::Submit));
+        assert_eq!(bare_enter("/model", 0, false), Some(BareEnter::Submit));
+        assert_eq!(bare_enter("/quit", 0, false), Some(BareEnter::Submit));
+    }
+
+    #[test]
+    fn bare_enter_prefix_completes_first_match() {
+        assert_eq!(bare_enter("/lo", 0, false), Some(BareEnter::Complete("/login ".into())));
+        assert_eq!(bare_enter("/mod", 0, false), Some(BareEnter::Complete("/model ".into())));
+    }
+
+    #[test]
+    fn bare_enter_highlight_completes_selection() {
+        // "/log" palette order: /login, /logout, /log.
+        assert_eq!(bare_enter("/log", 1, true), Some(BareEnter::Complete("/logout ".into())));
+        assert_eq!(bare_enter("/log", 2, true), Some(BareEnter::Complete("/log ".into())));
+    }
+
+    #[test]
+    fn bare_enter_non_command_untouched() {
+        assert_eq!(bare_enter("hello", 0, false), None);
+        assert_eq!(bare_enter("/model nvidia", 0, false), None);
+        assert_eq!(bare_enter("/zzz", 0, false), None);
     }
 
     #[test]

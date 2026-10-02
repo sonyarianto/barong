@@ -90,12 +90,9 @@ impl ToolRegistry {
 
     pub fn register_delegate(
         &mut self,
-        api_key: String,
-        model: String,
-        base_url: String,
-        provider: crate::agent::llm::ProviderKind,
+        endpoint: std::sync::Arc<std::sync::Mutex<delegate::ActiveEndpoint>>,
     ) {
-        self.register(Box::new(delegate::Delegate::new(api_key, model, base_url, provider)));
+        self.register(Box::new(delegate::Delegate::new(endpoint)));
     }
 
     pub fn register(&mut self, tool: Box<dyn Tool>) {

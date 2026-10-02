@@ -3,18 +3,27 @@ use crate::agent::llm::{AnthropicProvider, LLMProvider, OpenAIProvider, Provider
 use crate::tools::Tool;
 use anyhow::Result;
 use serde_json::Value;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
+/// Credentials + endpoint the delegate sub-agent uses.
+/// Shared with App so `/login` and `/model` switches apply to it too —
+/// otherwise it would keep calling the old provider with a stale key.
+#[derive(Debug, Clone)]
+pub struct ActiveEndpoint {
+    pub kind: ProviderKind,
+    pub api_key: String,
+    pub model: String,
+    pub base_url: String,
+}
+
 pub struct Delegate {
-    api_key: String,
-    model: String,
-    base_url: String,
-    provider: ProviderKind,
+    endpoint: Arc<Mutex<ActiveEndpoint>>,
 }
 
 impl Delegate {
-    pub fn new(api_key: String, model: String, base_url: String, provider: ProviderKind) -> Self {
-        Self { api_key, model, base_url, provider }
+    pub fn new(endpoint: Arc<Mutex<ActiveEndpoint>>) -> Self {
+        Self { endpoint }
     }
 }
 
@@ -43,16 +52,22 @@ impl Tool for Delegate {
 
     async fn call(&self, args: Value, tx: Option<mpsc::Sender<StreamEvent>>) -> Result<Value> {
         let task = args["task"].as_str().unwrap_or("");
+        let ep = self.endpoint.lock().map(|e| e.clone()).unwrap_or(ActiveEndpoint {
+            kind: ProviderKind::OpenAI,
+            api_key: String::new(),
+            model: "gpt-4o".into(),
+            base_url: "https://api.openai.com/v1".into(),
+        });
 
-        let llm_provider: Box<dyn LLMProvider> = match self.provider {
+        let llm_provider: Box<dyn LLMProvider> = match ep.kind {
             ProviderKind::OpenAI => Box::new(OpenAIProvider::new(
-                self.api_key.clone(),
-                self.model.clone(),
-                self.base_url.clone(),
+                ep.api_key.clone(),
+                ep.model.clone(),
+                ep.base_url.clone(),
             )),
             ProviderKind::Anthropic => Box::new(AnthropicProvider::new(
-                self.api_key.clone(),
-                self.model.clone(),
+                ep.api_key.clone(),
+                ep.model.clone(),
                 4096,
             )),
         };

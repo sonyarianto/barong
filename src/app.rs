@@ -35,11 +35,13 @@ pub struct App {
     pub provider: ProviderKind,
     pub provider_name: String,
     pub base_url: String,
+    pub endpoint: std::sync::Arc<std::sync::Mutex<crate::tools::delegate::ActiveEndpoint>>,
     pub current_model: String,
     pub cancelled: Arc<AtomicBool>,
     pub is_home: bool,
     // UX state (minimal)
     pub palette_idx: usize,
+    pub palette_navigated: bool,
     pub tool_expanded: bool,
     pub notice: Option<String>,
     pub spinner_tick: usize,
@@ -89,18 +91,19 @@ impl App {
         let mcp_servers = Self::init_mcp(&config, &mut tool_registry);
         let auth = AuthStore::new();
         let (delegate_key, _) = resolve_api_key(&provider_name, &auth, &config);
-        let delegate_base = base_url.clone();
-        let delegate_model = current_model.clone();
+        let endpoint = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::tools::delegate::ActiveEndpoint {
+                kind: provider,
+                api_key: delegate_key,
+                model: current_model.clone(),
+                base_url: base_url.clone(),
+            },
+        ));
         // delegate is opt-in extra (no sub-agents in core)
         if extras.iter().any(|e| {
             e.eq_ignore_ascii_case("delegate") || e.eq_ignore_ascii_case("all")
         }) {
-            tool_registry.register_delegate(
-                delegate_key,
-                delegate_model,
-                delegate_base,
-                provider,
-            );
+            tool_registry.register_delegate(endpoint.clone());
         }
 
         let tool_registry = Arc::new(tool_registry);
@@ -126,10 +129,12 @@ impl App {
             provider,
             provider_name: provider_name.clone(),
             base_url: base_url.clone(),
+            endpoint,
             current_model: current_model.clone(),
             cancelled: Arc::new(AtomicBool::new(false)),
             is_home: true,
             palette_idx: 0,
+            palette_navigated: false,
             tool_expanded: false,
             notice: if initial_key.is_empty() {
                 Some(format!("no API key for '{}' — /login {} or set env", provider_name, provider_name))
@@ -169,8 +174,15 @@ impl App {
         };
         self.current_model = model.trim().to_string();
         self.status.model = self.current_model.clone();
+        self.status.llm_provider = self.provider.to_string();
         let (key, src) = resolve_api_key(&id, &self.auth, &self.config);
         self.key_source = src;
+        if let Ok(mut ep) = self.endpoint.lock() {
+            ep.kind = self.provider;
+            ep.api_key = key.clone();
+            ep.model = self.current_model.clone();
+            ep.base_url = self.base_url.clone();
+        }
         if key.is_empty() {
             self.notice = Some(format!("no API key for '{}' — /login {}", id, id));
         }

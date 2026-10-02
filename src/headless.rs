@@ -92,12 +92,15 @@ pub fn build_ctx(cli: &Cli) -> Result<HeadlessCtx> {
     if extras.iter().any(|e| {
         e.eq_ignore_ascii_case("delegate") || e.eq_ignore_ascii_case("all")
     }) {
-        registry.register_delegate(
-            api_key.clone(),
-            model.clone(),
-            base_url.clone(),
-            provider_kind,
-        );
+        let endpoint = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::tools::delegate::ActiveEndpoint {
+                kind: provider_kind,
+                api_key: api_key.clone(),
+                model: model.clone(),
+                base_url: base_url.clone(),
+            },
+        ));
+        registry.register_delegate(endpoint);
     }
     // MCP servers (only those configured; failures warn)
     let mut mcp_servers = Vec::new();
