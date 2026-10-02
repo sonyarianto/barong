@@ -344,11 +344,11 @@ impl MarkdownRenderer {
                 }
                 if end > i + 1 {
                     let code = &text[i + 1..end];
+                    // Foreground only, no background block (opencode/pi style:
+                    // `markup.raw` is fg-only; bg blocks chop sentences apart).
                     spans.push(Span::styled(
                         format!("`{}`", code),
-                        Style::default()
-                            .fg(self.accent)
-                            .bg(self.muted),
+                        Style::default().fg(self.accent),
                     ));
                     for _ in 0..=(end - i) {
                         chars.next();
@@ -626,6 +626,16 @@ mod tests {
         assert!(joined.contains('☐') && joined.contains("todo"), "task open, got:\n{}", joined);
         assert!(joined.contains('☑') && !joined.contains("- ☑"), "task done replaces bullet, got:\n{}", joined);
         assert!(joined.contains('─'), "hr, got:\n{}", joined);
+    }
+
+    #[test]
+    fn inline_code_has_no_background_block() {
+        let md = MarkdownRenderer::new();
+        let out = md.render("Pakai `clap` untuk `--cwd`.", "assistant");
+        assert_eq!(out.len(), 1);
+        let code = out[0].spans.iter().find(|s| s.content == "`clap`").expect("code span");
+        assert_eq!(code.style.fg, Some(ratatui::style::Color::Cyan));
+        assert_eq!(code.style.bg, None, "bg blocks hurt readability");
     }
 
     #[test]
