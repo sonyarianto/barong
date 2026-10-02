@@ -402,7 +402,7 @@ impl App {
                             let text = std::mem::take(&mut self.streaming_text);
                             self.conversation.add_message("assistant".into(), text);
                         }
-                        let content = format!("▸ **{}** `{}`", name, args);
+                        let content = crate::agent::r#loop::describe_tool_call(&name, &args);
                         self.conversation.add_message("tool".into(), content);
                         self.should_auto_scroll = true;
                     }

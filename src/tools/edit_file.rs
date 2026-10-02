@@ -53,9 +53,13 @@ impl Tool for EditFile {
             .ok_or_else(|| anyhow::anyhow!("missing path (or file_path)"))?;
         let old = args["old_string"]
             .as_str()
+            .or_else(|| args["old_str"].as_str())
+            .or_else(|| args["old_text"].as_str())
             .ok_or_else(|| anyhow::anyhow!("missing old_string"))?;
         let new = args["new_string"]
             .as_str()
+            .or_else(|| args["new_str"].as_str())
+            .or_else(|| args["new_text"].as_str())
             .ok_or_else(|| anyhow::anyhow!("missing new_string"))?;
 
         let content = tokio::fs::read_to_string(path).await?;

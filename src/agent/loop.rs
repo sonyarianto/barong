@@ -230,6 +230,71 @@ async fn wait_for_approval(
     }
 }
 
+/// Human-readable one-liner for a tool call (`read src/main.rs:1-200`
+/// instead of raw JSON). First line feeds the collapsed view; the raw args
+/// follow for the expanded (Ctrl+O) view.
+pub fn describe_tool_call(name: &str, args: &serde_json::Value) -> String {
+    fn s(v: &serde_json::Value, keys: &[&str]) -> Option<String> {
+        keys.iter()
+            .filter_map(|k| v.get(k).and_then(|x| x.as_str()))
+            .next()
+            .map(|x| x.to_string())
+    }
+    fn n(v: &serde_json::Value, keys: &[&str]) -> Option<u64> {
+        keys.iter().filter_map(|k| v.get(k).and_then(|x| x.as_u64())).next()
+    }
+    let summary = match name {
+        "read" => {
+            let p = s(args, &["path", "file_path"]).unwrap_or_else(|| "?".into());
+            if let Some(pat) = args.get("pattern").and_then(|v| v.as_str()) {
+                format!("{} ({})", p, pat)
+            } else {
+                let start = n(args, &["offset", "line_start", "start_line"]).unwrap_or(1).max(1);
+                let end = n(args, &["line_end", "end_line"])
+                    .or_else(|| n(args, &["limit"]).map(|l| start + l.saturating_sub(1)));
+                match end {
+                    Some(e) if e != start => format!("{}:{}-{}", p, start, e),
+                    _ if start > 1 => format!("{}:{}-…", p, start),
+                    _ => p,
+                }
+            }
+        }
+        "write" => {
+            let p = s(args, &["path", "file_path"]).unwrap_or_else(|| "?".into());
+            let len = args
+                .get("content")
+                .or_else(|| args.get("text"))
+                .and_then(|v| v.as_str())
+                .map(|t| t.chars().count())
+                .unwrap_or(0);
+            format!("{} ({} chars)", p, len)
+        }
+        "edit" => s(args, &["path", "file_path"]).unwrap_or_else(|| "?".into()),
+        "bash" => s(args, &["command", "cmd"]).map(|c| truncate_middle(&c, 100)).unwrap_or_else(|| "?".into()),
+        "grep" | "search" => {
+            let pat = s(args, &["pattern"]).unwrap_or_else(|| "?".into());
+            let dir = s(args, &["path"]).unwrap_or_else(|| ".".into());
+            format!("{} in {}", pat, dir)
+        }
+        "glob" => {
+            let pat = s(args, &["pattern"]).unwrap_or_else(|| "*".into());
+            let dir = s(args, &["path"]).unwrap_or_else(|| ".".into());
+            format!("{} in {}", pat, dir)
+        }
+        "delegate" => s(args, &["task"]).map(|t| truncate_middle(&t, 80)).unwrap_or_else(|| "?".into()),
+        _ => truncate_middle(&args.to_string(), 100),
+    };
+    let raw = serde_json::to_string_pretty(args).unwrap_or_default();
+    format!("▸ **{}** {}\n```json\n{}\n```", name, summary, raw)
+}
+
+fn truncate_middle(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    format!("{}…", s.chars().take(max.saturating_sub(1)).collect::<String>())
+}
+
 pub fn summarize_result(tool: &str, content: &str, max_lines: usize) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let total_lines = lines.len();
@@ -294,5 +359,39 @@ fn summarize_json(val: &serde_json::Value) -> String {
             }
         }
         _ => format!("{}", val),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn first_line(s: &str) -> &str {
+        s.lines().next().unwrap_or("")
+    }
+
+    #[test]
+    fn describe_read_variants() {
+        // The exact call from the bug report.
+        let args = serde_json::json!({"line_end": 200, "line_start": 1, "path": "src/main.rs"});
+        assert!(first_line(&describe_tool_call("read", &args)).contains("src/main.rs:1-200"), "{}", describe_tool_call("read", &args));
+        let args = serde_json::json!({"path": "src/main.rs", "offset": 50, "limit": 10});
+        assert!(first_line(&describe_tool_call("read", &args)).contains("src/main.rs:50-59"));
+        let args = serde_json::json!({"path": "src"});
+        assert!(first_line(&describe_tool_call("read", &args)).contains("src"));
+        assert!(!first_line(&describe_tool_call("read", &args)).contains('{'), "first line must be clean");
+    }
+
+    #[test]
+    fn describe_other_tools() {
+        let args = serde_json::json!({"path": "a.txt", "content": "hi"});
+        assert!(first_line(&describe_tool_call("write", &args)).contains("a.txt (2 chars)"));
+        let args = serde_json::json!({"command": "cargo test"});
+        assert!(first_line(&describe_tool_call("bash", &args)).contains("cargo test"));
+        let args = serde_json::json!({"pattern": "foo", "path": "src"});
+        assert!(first_line(&describe_tool_call("grep", &args)).contains("foo in src"));
+        // Raw JSON stays available for the expanded view.
+        let full = describe_tool_call("read", &serde_json::json!({"path": "x"}));
+        assert!(full.contains("\"path\""));
     }
 }

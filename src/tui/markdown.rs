@@ -248,6 +248,10 @@ impl MarkdownRenderer {
                 lines.push(Line::from(line_spans));
             }
         }
+        // Bottom breathing room mirrors the top gap.
+        if let Some(gap) = self.code_gap(prefix) {
+            lines.push(gap);
+        }
     }
 
     fn flush_table<'a>(&self, lines: &mut Vec<Line<'a>>, prefix: &Span<'a>, in_table: &mut bool, table_lines: &mut Vec<String>) {
@@ -663,8 +667,8 @@ mod tests {
     fn wide_container_rows_span_full_width() {
         let md = MarkdownRenderer::new().with_width(60);
         let out = flat(&md.render("```go\nx\n```", "assistant"));
-        // label + breathing gap + 1 code row, no rules anywhere.
-        assert_eq!(out.len(), 3, "label + gap + 1 code, got: {:?}", out);
+        // label + top gap + 1 code + bottom gap, no rules anywhere.
+        assert_eq!(out.len(), 4, "label + gap + 1 code + gap, got: {:?}", out);
         assert!(out[0].contains("go"), "label, got: {}", out[0]);
         assert!(!out[0].contains('╭') && !out[0].contains('─'), "no rules, got: {}", out[0]);
         for (i, l) in out.iter().enumerate() {
@@ -672,8 +676,9 @@ mod tests {
             assert_eq!(l.width(), 60, "row {} full width, got: {}", i, l);
             assert!(l.starts_with("▎ "), "left-hugging bar, got: {}", l);
         }
-        // Gap row carries no content.
+        // Gap row carries no content (top and bottom).
         assert!(out[1].trim_start_matches(['▎', ' ']).is_empty(), "gap, got: {}", out[1]);
+        assert!(out[3].trim_start_matches(['▎', ' ']).is_empty(), "gap, got: {}", out[3]);
         assert!(out[2].contains('1'), "gutter, got: {}", out[2]);
     }
 }

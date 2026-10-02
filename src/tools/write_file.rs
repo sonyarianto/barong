@@ -49,6 +49,7 @@ impl Tool for WriteFile {
             .ok_or_else(|| anyhow::anyhow!("missing path (or file_path)"))?;
         let content = args["content"]
             .as_str()
+            .or_else(|| args["text"].as_str())
             .ok_or_else(|| anyhow::anyhow!("missing content"))?;
 
         if let Some(parent) = std::path::Path::new(path).parent() {
