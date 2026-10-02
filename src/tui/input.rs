@@ -283,7 +283,14 @@ enum BareEnter {
 
 fn bare_enter(buffer: &str, palette_idx: usize, navigated: bool) -> Option<BareEnter> {
     if !buffer.starts_with('/') || buffer.contains(' ') || buffer.contains('\n') {
+        // NOTE: trailing-space buffers ("/login ", "/model x") are picker
+        // mode, not bare mode — they must fall through to handle_slash.
+        // Never .trim() here: "/login " trimmed looks bare but isn't.
         return None;
+    }
+    // Bare `/login` opens the interactive provider picker instead of submitting.
+    if buffer.trim() == "/login" {
+        return Some(BareEnter::Complete("/login ".into()));
     }
     if navigated {
         let items = command_palette(buffer);
@@ -700,15 +707,8 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                 }
             }
             KeyCode::Enter => {
-                // Bare `/login` opens the interactive provider picker.
-                if app.input.buffer.trim() == "/login" {
-                    app.input.buffer = "/login ".to_string();
-                    app.input.cursor_pos = app.input.buffer.len();
-                    app.login_idx = 0;
-                    app.login_navigated = false;
-                    return Ok(());
-                }
-                // Bare `/xxx`: exact command runs, highlight completes.
+                // Bare `/xxx`: exact command runs, highlight completes,
+                // bare `/login` opens the provider picker.
                 match bare_enter(&app.input.buffer, app.palette_idx, app.palette_navigated) {
                     Some(BareEnter::Complete(text)) => {
                         app.input.buffer = text;
@@ -1360,6 +1360,14 @@ mod tests {
         assert_eq!(bare_enter("hello", 0, false), None);
         assert_eq!(bare_enter("/model nvidia", 0, false), None);
         assert_eq!(bare_enter("/zzz", 0, false), None);
+    }
+
+    #[test]
+    fn bare_enter_login_opens_picker_not_submit() {
+        // No trim-trap: "/login " (picker open) must fall through to handle_slash.
+        assert_eq!(bare_enter("/login", 0, false), Some(BareEnter::Complete("/login ".into())));
+        assert_eq!(bare_enter("/login ", 0, false), None);
+        assert_eq!(bare_enter("/login ", 2, true), None);
     }
 
     #[test]
