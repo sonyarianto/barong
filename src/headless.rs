@@ -177,8 +177,15 @@ fn base_messages(ctx: &HeadlessCtx, prompt: &str) -> Vec<crate::agent::conversat
     conv.full_context()
 }
 
-fn require_key(ctx: &HeadlessCtx) -> Result<()> {
-    if ctx.api_key.is_empty() {
+fn headless_meta(ctx: &HeadlessCtx) -> crate::session::SessionMeta {
+    crate::session::SessionMeta {
+        provider: ctx.provider_name.clone(),
+        model: ctx.model.clone(),
+        theme: ctx.config.resolve_theme(),
+    }
+}
+
+fn require_key(ctx: &HeadlessCtx) -> Result<()> {    if ctx.api_key.is_empty() {
         let env = format!("{}_API_KEY", ctx.provider_name.to_uppercase().replace('-', "_"));
         anyhow::bail!(
             "no API key for provider '{}'. Set {} (or BARONG_API_KEY), add it to ~/.barong/auth.json via `/login {}`, or use --provider/--model for another endpoint.",
@@ -235,7 +242,7 @@ pub async fn run_print(prompt: &str, cli: &Cli) -> Result<()> {
         if !final_text.is_empty() {
             conv.add_message("assistant".into(), final_text.clone());
         }
-        sm.save(&conv.messages);
+        sm.save(&conv.messages, &headless_meta(&ctx));
     }
 
     print!("{}", final_text);
@@ -315,7 +322,7 @@ pub async fn run_json(prompt: &str, cli: &Cli) -> Result<()> {
     if !final_text.is_empty() {
         conv.add_message("assistant".into(), final_text);
     }
-    sm.save(&conv.messages);
+    sm.save(&conv.messages, &headless_meta(&ctx));
     Ok(())
 }
 

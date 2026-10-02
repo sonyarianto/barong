@@ -303,11 +303,12 @@ mod tests {
 
     #[test]
     fn test_extra_tools_env() {
-        std::env::set_var("BARONG_EXTRA_TOOLS", "grep,glob");
+        // SAFETY: unique var name, restored below; no other test reads it mid-flight.
+        unsafe { std::env::set_var("BARONG_EXTRA_TOOLS", "grep,glob"); }
         let cfg = Config::default();
         let extras = cfg.resolve_extra_tools();
         assert!(extras.contains(&"grep".to_string()));
-        std::env::remove_var("BARONG_EXTRA_TOOLS");
+        unsafe { std::env::remove_var("BARONG_EXTRA_TOOLS"); }
     }
 
     #[test]

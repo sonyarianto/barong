@@ -181,7 +181,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("barong-auth-prec-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         // Unique provider id so the env var can't collide with other tests.
-        std::env::set_var("TESTPROVXYZ_API_KEY", "from-env");
+        // SAFETY: unique var name, no other test touches it.
+        unsafe { std::env::set_var("TESTPROVXYZ_API_KEY", "from-env"); }
         let cfg = Config::default();
         let a = AuthStore::load_from(dir.join("auth.json"));
         let (k, src) = resolve_api_key("testprovxyz", &a, &cfg);
@@ -190,7 +191,7 @@ mod tests {
         a.set("testprovxyz", "from-auth");
         let (k, src) = resolve_api_key("testprovxyz", &a, &cfg);
         assert_eq!((k.as_str(), src), ("from-auth", "auth.json"));
-        std::env::remove_var("TESTPROVXYZ_API_KEY");
+        unsafe { std::env::remove_var("TESTPROVXYZ_API_KEY"); }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

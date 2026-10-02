@@ -492,7 +492,24 @@ pub fn expand_mentions(text: &str, root: &std::path::Path) -> (String, Vec<Strin
 }
 
 pub fn handle_events(app: &mut App) -> Result<()> {
-    if let Event::Key(key) = event::read()? {
+    let ev = event::read()?;
+    // Mouse wheel scrolls the transcript (terminal scrollback is unavailable
+    // in the alternate screen, so without this the wheel does nothing).
+    if let Event::Mouse(m) = ev {
+        match m.kind {
+            crossterm::event::MouseEventKind::ScrollUp => {
+                app.chat_scroll = app.chat_scroll.saturating_sub(3);
+                app.should_auto_scroll = false;
+            }
+            crossterm::event::MouseEventKind::ScrollDown => {
+                app.chat_scroll = app.chat_scroll.saturating_add(3);
+                app.should_auto_scroll = false;
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+    if let Event::Key(key) = ev {
         if key.kind != KeyEventKind::Press {
             return Ok(());
         }
@@ -1064,7 +1081,7 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
                 } else {
                     let mut out = String::from("**Recent sessions:**\n");
                     for s in sessions.iter().take(5) {
-                        out.push_str(&format!("- `{}` — {} msgs\n", s.id, s.messages.len()));
+                        out.push_str(&format!("- `{}` — {} msgs · {}\n", s.id, s.messages.len(), crate::session::SessionManager::title(s)));
                     }
                     out.push_str("\nUse `/resume <id>`");
                     app.conversation.add_message("assistant".into(), out);
@@ -1176,7 +1193,8 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
         "/branch" => {
             let name = if arg.is_empty() { "branch" } else { arg };
             let parent = app.session_id.clone();
-            let id = app.session_manager.fork(&app.conversation.messages, parent.as_deref(), name);
+            let meta = app.session_meta();
+            let id = app.session_manager.fork(&app.conversation.messages, parent.as_deref(), name, &meta);
             app.session_id = Some(id.clone());
             app.conversation.add_message("assistant".into(), format!("Branched `{}` from `{}`", id, parent.as_deref().unwrap_or("(unsaved)")));
             app.save_session();
@@ -1194,7 +1212,7 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
                     let cur = if Some(&s.id) == app.session_id.as_ref() { " ← current" } else { "" };
                     let branch = s.branch.as_deref().unwrap_or("-");
                     let parent = s.parent_id.as_deref().unwrap_or("-");
-                    out.push_str(&format!("- `{}` — {} msgs · branch `{}` · parent `{}`{}\n", s.id, s.messages.len(), branch, parent, cur));
+                    out.push_str(&format!("- `{}` — {} msgs · branch `{}` · parent `{}` · {}{}\n", s.id, s.messages.len(), branch, parent, crate::session::SessionManager::title(s), cur));
                 }
                 out.push_str("\nUse `/resume <id>` or `/branch [name]`");
                 app.conversation.add_message("assistant".into(), out);
@@ -1204,7 +1222,7 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
             return Ok(true);
         }
         "/hotkeys" => {
-            app.conversation.add_message("assistant".into(), "**Keys:**\n- `Enter` send · `Shift+Enter/Ctrl+J` newline\n- `Tab` complete `/` or `@` · `Up/Down` palette/history\n- `Ctrl+C` clear/quit · `Ctrl+D` quit · `Ctrl+U/K/W` edit · `Ctrl+A/E` jump\n- `Ctrl+O` expand tools · `Ctrl+T` tree panel · `Esc` cancel · `PgUp/PgDn` scroll\n- approval modal: `y` once · `a` always · `n`/`Esc` deny".into());
+            app.conversation.add_message("assistant".into(), "**Keys:**\n- `Enter` send · `Shift+Enter/Ctrl+J` newline\n- `Tab` complete `/` or `@` · `Up/Down` palette/history\n- `Ctrl+C` clear/quit · `Ctrl+D` quit · `Ctrl+U/K/W` edit · `Ctrl+A/E` jump\n- `Ctrl+O` expand tools · `Ctrl+T` tree panel · `Esc` cancel · `PgUp/PgDn` or wheel scroll\n- approval modal: `y` once · `a` always · `n`/`Esc` deny".into());
             app.save_session();
             app.is_home = false;
             return Ok(true);
@@ -1253,16 +1271,23 @@ mod tests {
     use super::*;
     use crate::config::Config;
 
-    /// App isolated from the real ~/.barong (temp HOME + throwaway key).
+    /// App isolated from the real ~/.barong (unique temp HOME per call, so
+    /// session-restore never leaks state between tests).
     fn test_app() -> App {
-        let tmp = std::env::temp_dir().join(format!("barong-model-repro-{}", std::process::id()));
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let tmp = std::env::temp_dir().join(format!("barong-test-{}-{}", std::process::id(), n));
         let _ = std::fs::create_dir_all(&tmp);
         let orig = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &tmp);
+        // SAFETY: only this test touches HOME, and no other test reads it
+        // concurrently (all other env use is disjoint var names).
+        unsafe { std::env::set_var("HOME", &tmp); }
         let app = App::new_with_config(Config::default(), vec![]);
         match orig {
-            Some(o) => std::env::set_var("HOME", o),
-            None => std::env::remove_var("HOME"),
+            // SAFETY: restoring what we found, same reasoning as above.
+            Some(o) => unsafe { std::env::set_var("HOME", o) },
+            None => unsafe { std::env::remove_var("HOME") },
         }
         app
     }
@@ -1339,11 +1364,12 @@ mod tests {
         // Inject discovery results via temp-HOME cache file path (isolated).
         let tmp = std::env::temp_dir().join(format!("barong-model-repro-{}", std::process::id()));
         let orig = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &tmp);
+        // SAFETY: same as test_app — isolated temp dir, disjoint from other tests.
+        unsafe { std::env::set_var("HOME", &tmp); }
         app.discovered.put("nvidia", vec!["openai/gpt-oss-20b".into(), "live/custom-1".into()]);
         match orig {
-            Some(o) => std::env::set_var("HOME", o),
-            None => std::env::remove_var("HOME"),
+            Some(o) => unsafe { std::env::set_var("HOME", o) },
+            None => unsafe { std::env::remove_var("HOME") },
         }
         let items = model_entries(&app, "gpt-oss");
         assert_eq!(items.len(), 1, "live + catalog dupe must collapse, got: {:?}", items);

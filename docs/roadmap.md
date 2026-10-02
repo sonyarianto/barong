@@ -36,13 +36,27 @@
 - [ ] Token usage tracking
 
 ## Phase 5: Workspace Intelligence
-- [ ] File tree panel
-- [ ] Git status awareness
-- [ ] Project context injection
+- [x] File tree panel (`/tree`, Ctrl+T)
+- [x] Git status awareness (branch + changed count in tree panel + prompt)
+- [x] Project context injection (AGENTS.md + file tree in system prompt)
 
 ## Phase 6: Polish
-- [ ] Syntax highlighting
-- [ ] Session persistence
-- [ ] Config file
-- [ ] MCP support
-- [ ] Sub-agents
+- [x] Syntax highlighting (syntect, per-theme)
+- [x] Session persistence (resume + endpoint snapshot + crash-safe saves)
+- [x] Config file (`barong.jsonc`, env overrides, `--provider/--model/--yes`)
+- [x] MCP support
+- [x] Sub-agents (opt-in `delegate` tool)
+
+## Phase 7: Provider UX (done, unplanned)
+- [x] Provider registry (openrouter/deepseek/nvidia/ollama/custom)
+- [x] `auth.json` key store + `/login` picker + masked entry
+- [x] `/model` picker (auth status, free-form ids) + live `/v1/models` discovery
+- [x] Permission confirm modal (`y`/`a`/`n`) + headless deny-by-default
+- [x] Auto-compact at 85% ctx, theme system, session branching
+
+## Backlog (honest gaps)
+- [ ] Token usage tracking vs real model limits
+- [ ] Agent-loop integration test with mock provider
+- [ ] Copy-code button on code blocks (pi has `[Copy]`)
+- [ ] Diff preview for edit/write approvals (modal shows raw JSON today)
+- [ ] Retry with backoff on transient LLM errors

@@ -63,9 +63,32 @@ async fn run_tui(auto_approve: bool, provider: Option<&str>, model: Option<&str>
     // ratatui is sync; run it on blocking thread scope via existing loop.
     // We are already inside tokio runtime, App::start_agent spawns tasks onto it.
     let terminal = ratatui::init();
+    // Wheel scrolling needs explicit mouse capture; guard restores it on panic.
+    let _mouse = MouseGuard::new();
     let result = run_blocking(terminal, auto_approve, provider, model);
     ratatui::restore();
     result
+}
+
+struct MouseGuard;
+
+impl MouseGuard {
+    fn new() -> Self {
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::EnableMouseCapture
+        );
+        Self
+    }
+}
+
+impl Drop for MouseGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::DisableMouseCapture
+        );
+    }
 }
 
 fn run_blocking(

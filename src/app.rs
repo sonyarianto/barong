@@ -68,14 +68,27 @@ impl App {
     }
 
     pub fn new_with_config(config: Config, cli_extra_tools: Vec<String>) -> Self {
-        let provider_name = config.resolve_provider();
+        let session_manager = SessionManager::new();
+        // Resume where you left off: restore transcript + endpoint + theme.
+        // Falls back to config defaults for fresh starts or old session files.
+        let restored = session_manager.most_recent_nonempty();
+
+        let provider_name = restored
+            .as_ref()
+            .and_then(|s| s.provider.clone())
+            .map(|p| p.trim().to_lowercase())
+            .filter(|p| !p.is_empty() && config.resolve_provider_config(p).known)
+            .unwrap_or_else(|| config.resolve_provider());
         let rpc = config.resolve_provider_config(&provider_name);
         let provider = ProviderKind::from_str(&rpc.api);
-        let current_model = config
-            .model
-            .clone()
+        let current_model = restored
+            .as_ref()
+            .and_then(|s| s.model.clone())
             .map(|m| m.trim().to_string())
             .filter(|m| !m.is_empty())
+            .or_else(|| {
+                config.model.clone().map(|m| m.trim().to_string()).filter(|m| !m.is_empty())
+            })
             .unwrap_or_else(|| config.resolve_default_model(&provider_name));
         let base_url = if rpc.base_url.is_empty() {
             config.resolve_base_url()
@@ -85,10 +98,22 @@ impl App {
         let mut extras = config.resolve_extra_tools();
         extras.extend(cli_extra_tools);
         let mut tool_registry = ToolRegistry::new().with_extras(&extras);
-        let session_manager = SessionManager::new();
 
-        let conversation = Conversation::new();
-        let session_id = session_manager.most_recent_session().map(|s| s.id);
+        let restored_theme = restored
+            .as_ref()
+            .and_then(|s| s.theme.clone())
+            .map(|t| theme::resolve(&t))
+            .unwrap_or_else(|| theme::resolve(&config.resolve_theme()));
+        let (conversation, session_id, restored_id) = match restored {
+            Some(s) => {
+                let mut c = Conversation::new();
+                c.messages = s.messages;
+                let id = s.id.clone();
+                (c, Some(id.clone()), Some(id))
+            }
+            None => (Conversation::new(), None, None),
+        };
+        // NOTE: `restored` was moved by the match above; theme came from `restored_theme`.
 
         let mcp_servers = Self::init_mcp(&config, &mut tool_registry);
         let auth = AuthStore::new();
@@ -110,8 +135,9 @@ impl App {
 
         let tool_registry = Arc::new(tool_registry);
         let permission_gate = PermissionGate::new(config.resolve_auto_approve());
-        let theme = theme::resolve(&config.resolve_theme());
+        let theme = restored_theme;
         let (initial_key, key_source) = resolve_api_key(&provider_name, &auth, &config);
+        let is_home = conversation.messages.is_empty();
 
         Self {
             conversation,
@@ -134,12 +160,15 @@ impl App {
             endpoint,
             current_model: current_model.clone(),
             cancelled: Arc::new(AtomicBool::new(false)),
-            is_home: true,
+            is_home,
             palette_idx: 0,
             palette_navigated: false,
             tool_expanded: false,
             notice: if initial_key.is_empty() {
                 Some(format!("no API key for '{}' — /login {} or set env", provider_name, provider_name))
+            } else if let Some(id) = restored_id {
+                let short: String = id.chars().take(12).collect();
+                Some(format!("resumed session {} — /new for fresh", short))
             } else {
                 None
             },
@@ -354,6 +383,8 @@ impl App {
     }
 
     pub fn handle_stream(&mut self) -> Result<()> {
+        // Deferred persist: the rx borrow below forbids &mut self calls inline.
+        let mut dirty = false;
         if let Some(rx) = &mut self.event_rx {
             loop {
                 match rx.try_recv() {
@@ -381,6 +412,8 @@ impl App {
                         self.conversation
                             .add_message("tool".into(), format!("\n{}", summary));
                         self.should_auto_scroll = true;
+                        // Crash-safe: persist progress as tools complete.
+                        dirty = true;
                     }
                     Ok(StreamEvent::PermissionRequest { id, name, args }) => {
                         self.pending_approval = Some(PendingTool { id, name, args });
@@ -422,14 +455,26 @@ impl App {
                 }
             }
         }
+        if dirty {
+            self.save_session();
+        }
         Ok(())
     }
 
+    pub fn session_meta(&self) -> crate::session::SessionMeta {
+        crate::session::SessionMeta {
+            provider: self.provider_name.clone(),
+            model: self.current_model.clone(),
+            theme: self.theme.name.clone(),
+        }
+    }
+
     pub fn save_session(&mut self) {
+        let meta = self.session_meta();
         match self.session_id.as_ref() {
-            Some(id) => self.session_manager.update(id, &self.conversation.messages),
+            Some(id) => self.session_manager.update(id, &self.conversation.messages, &meta),
             None => {
-                let id = self.session_manager.save(&self.conversation.messages);
+                let id = self.session_manager.save(&self.conversation.messages, &meta);
                 self.session_id = Some(id);
             }
         }

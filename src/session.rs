@@ -12,6 +12,22 @@ pub struct Session {
     pub parent_id: Option<String>,
     #[serde(default)]
     pub branch: Option<String>,
+    /// Active endpoint when saved — restored on relaunch so a restart
+    /// continues exactly where you left off (no silent reset to defaults).
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub theme: Option<String>,
+}
+
+/// Endpoint snapshot stored alongside a session.
+#[derive(Debug, Default)]
+pub struct SessionMeta {
+    pub provider: String,
+    pub model: String,
+    pub theme: String,
 }
 
 pub struct SessionManager {
@@ -36,6 +52,14 @@ impl SessionManager {
         let mut list = self.list_sessions();
         list.sort_by(|a, b| b.updated.cmp(&a.updated));
         list.into_iter().next()
+    }
+
+    /// Most recent session that actually has content. Empty shells created by
+    /// bare slash commands must never shadow real history on relaunch.
+    pub fn most_recent_nonempty(&self) -> Option<Session> {
+        let mut list = self.list_sessions();
+        list.sort_by(|a, b| b.updated.cmp(&a.updated));
+        list.into_iter().find(|s| !s.messages.is_empty())
     }
 
     pub fn list_sessions(&self) -> Vec<Session> {
@@ -85,7 +109,7 @@ impl SessionManager {
         Ok(())
     }
 
-    pub fn save(&self, messages: &[Message]) -> String {
+    pub fn save(&self, messages: &[Message], meta: &SessionMeta) -> String {
         let id = chrono_format();
         let now = human_time();
         let session = Session {
@@ -95,6 +119,9 @@ impl SessionManager {
             messages: messages.to_vec(),
             parent_id: None,
             branch: None,
+            provider: Some(meta.provider.clone()),
+            model: Some(meta.model.clone()),
+            theme: Some(meta.theme.clone()),
         };
         let path = self.session_path(&id);
         if let Ok(json) = serde_json::to_string_pretty(&session) {
@@ -103,7 +130,7 @@ impl SessionManager {
         id
     }
 
-    pub fn update(&self, id: &str, messages: &[Message]) {
+    pub fn update(&self, id: &str, messages: &[Message], meta: &SessionMeta) {
         let path = self.session_path(id);
         if !path.exists() {
             return;
@@ -112,6 +139,9 @@ impl SessionManager {
             if let Ok(mut session) = serde_json::from_str::<Session>(&content) {
                 session.messages = messages.to_vec();
                 session.updated = human_time();
+                session.provider = Some(meta.provider.clone());
+                session.model = Some(meta.model.clone());
+                session.theme = Some(meta.theme.clone());
                 if let Ok(json) = serde_json::to_string_pretty(&session) {
                     let _ = std::fs::write(&path, json);
                 }
@@ -120,7 +150,7 @@ impl SessionManager {
     }
 
     /// Fork current messages into a new branch session.
-    pub fn fork(&self, messages: &[Message], parent_id: Option<&str>, branch: &str) -> String {
+    pub fn fork(&self, messages: &[Message], parent_id: Option<&str>, branch: &str, meta: &SessionMeta) -> String {
         let id = chrono_format();
         let now = human_time();
         let session = Session {
@@ -130,12 +160,26 @@ impl SessionManager {
             messages: messages.to_vec(),
             parent_id: parent_id.map(|s| s.to_string()),
             branch: Some(branch.to_string()),
+            provider: Some(meta.provider.clone()),
+            model: Some(meta.model.clone()),
+            theme: Some(meta.theme.clone()),
         };
         let path = self.session_path(&id);
         if let Ok(json) = serde_json::to_string_pretty(&session) {
             let _ = std::fs::write(path, json);
         }
         id
+    }
+    pub fn title(s: &Session) -> String {
+        let first = s.messages.iter().find(|m| m.role == "user").and_then(|m| m.content.clone()).unwrap_or_default();
+        let one_line: String = first.split_whitespace().collect::<Vec<_>>().join(" ");
+        if one_line.is_empty() {
+            return "(empty)".to_string();
+        }
+        if one_line.chars().count() <= 60 {
+            return one_line;
+        }
+        format!("{}…", one_line.chars().take(59).collect::<String>())
     }
 }
 

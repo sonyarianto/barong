@@ -108,7 +108,7 @@ fn render_chat(frame: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
-    let md = crate::tui::markdown::MarkdownRenderer::with_theme(&app.theme);
+    let md = crate::tui::markdown::MarkdownRenderer::with_theme(&app.theme).with_width(area.width);
     let mut all_lines: Vec<Line> = Vec::new();
 
     for msg in &app.conversation.messages {
@@ -151,6 +151,10 @@ fn render_chat(frame: &mut Frame, area: Rect, app: &mut App) {
         app.chat_scroll = total.saturating_sub(visible);
     }
     let scroll = app.chat_scroll.min(total.saturating_sub(1).max(0));
+    // Scrolled back to the bottom (wheel/PgDn) → resume follow mode.
+    if scroll + visible >= total {
+        app.should_auto_scroll = true;
+    }
     let visible_lines: Vec<Line> = all_lines.into_iter().skip(scroll).take(visible).collect();
     frame.render_widget(Paragraph::new(visible_lines).wrap(Wrap { trim: false }), area);
 }
