@@ -1701,8 +1701,8 @@ mod tests {
     fn login_empty_enter_picks_first_keyless_provider() {
         let mut app = test_app();
         handle_slash(&mut app, "/login ").unwrap();
-        // ollama is always ready (dummy) so it must be skipped.
-        assert_eq!(app.pending_login.as_deref(), Some("anthropic"));
+        // ollama is always ready (dummy) so it must be skipped; 9router sorts first.
+        assert_eq!(app.pending_login.as_deref(), Some("9router"));
     }
 
     #[test]

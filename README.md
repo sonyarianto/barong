@@ -22,7 +22,9 @@ Keys live in `~/.barong/auth.json` (0600) — never in project files.
 - `/logout <provider>` removes a saved key
 
 Supported out of the box: `openai`, `anthropic`, `openrouter`,
-`deepseek`, `nvidia`, `ollama` (keyless local). Any other
+`deepseek`, `nvidia`, `9router` (local gateway at
+`http://localhost:20128/v1`, key from its dashboard via
+`NINEROUTER_API_KEY` or `/login 9router`), `ollama` (keyless local). Any other
 OpenAI-compatible endpoint goes in `barong.jsonc`:
 
 ```jsonc

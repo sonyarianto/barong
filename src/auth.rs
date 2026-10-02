@@ -115,9 +115,12 @@ pub fn resolve_api_key(
         }
     }
     // Legacy env names.
+    // (`9ROUTER_API_KEY` can't be `export`ed in POSIX shells — starts with a
+    // digit — so NINEROUTER_API_KEY is the practical spelling.)
     let legacy: &[&str] = match id.as_str() {
         "anthropic" => &["ANTHROPIC_API_KEY", "BARONG_API_KEY"],
         "openai" => &["OPENAI_API_KEY", "BARONG_API_KEY"],
+        "9router" => &["9ROUTER_API_KEY", "NINEROUTER_API_KEY", "BARONG_API_KEY"],
         _ => &["BARONG_API_KEY"],
     };
     for name in legacy {
@@ -193,5 +196,20 @@ mod tests {
         assert_eq!((k.as_str(), src), ("from-auth", "auth.json"));
         unsafe { std::env::remove_var("TESTPROVXYZ_API_KEY"); }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ninerouter_env_alias_resolves() {
+        use crate::config::Config;
+        // NINEROUTER_API_KEY is the shell-friendly spelling (9ROUTER_API_KEY
+        // can't be `export`ed — leading digit).
+        // SAFETY: real name but near-zero collision in test envs; restored below.
+        unsafe { std::env::set_var("NINEROUTER_API_KEY", "sk-9r-test"); }
+        let dir = std::env::temp_dir().join(format!("barong-auth-9r-{}", std::process::id()));
+        let cfg = Config::default();
+        let a = AuthStore::load_from(dir.join("auth.json"));
+        let (k, src) = resolve_api_key("9router", &a, &cfg);
+        assert_eq!((k.as_str(), src), ("sk-9r-test", "env"));
+        unsafe { std::env::remove_var("NINEROUTER_API_KEY"); }
     }
 }

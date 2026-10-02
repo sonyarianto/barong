@@ -112,12 +112,19 @@ impl Config {
                 "NVIDIA_API_KEY", true)),
             "ollama" => Some(("openai", "http://localhost:11434/v1",
                 &["qwen2.5-coder:7b", "llama3.1:8b"], "", false)),
+            // 9Router: local smart gateway (npm i -g 9router) routing 60+
+            // providers with subscription/cheap/free fallback. Dashboard key.
+            // Live ids come from discovery (/v1/models); catalog below is a
+            // starter (free tier first = sensible default).
+            "9router" => Some(("openai", "http://localhost:20128/v1",
+                &["kr/claude-sonnet-4.5", "cc/claude-opus-4-5"],
+                "NINEROUTER_API_KEY", true)),
             _ => None,
         }
     }
 
     pub fn known_provider_ids() -> Vec<&'static str> {
-        vec!["openai", "anthropic", "openrouter", "deepseek", "nvidia", "ollama"]
+        vec!["openai", "anthropic", "openrouter", "deepseek", "nvidia", "ollama", "9router"]
     }
 
     /// All provider ids: built-ins plus user-defined in config.
@@ -323,7 +330,12 @@ mod tests {
         assert!(d.models.contains(&"deepseek-chat".to_string()));
         let n = cfg.resolve_provider_config("nvidia");
         assert_eq!(n.base_url, "https://integrate.api.nvidia.com/v1");
-        // Unknown provider: openai-flavored, empty base/models.
+        // 9Router: local OpenAI-compatible gateway, free tier first.
+        let r = cfg.resolve_provider_config("9router");
+        assert_eq!(r.api, "openai");
+        assert_eq!(r.base_url, "http://localhost:20128/v1");
+        assert_eq!(cfg.resolve_default_model("9router"), "kr/claude-sonnet-4.5");
+        assert!(cfg.all_provider_ids().contains(&"9router".to_string()));        // Unknown provider: openai-flavored, empty base/models.
         let x = cfg.resolve_provider_config("acme");
         assert!(!x.known);
         assert_eq!(cfg.resolve_default_model("deepseek"), "deepseek-chat");
