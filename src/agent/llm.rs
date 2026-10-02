@@ -9,13 +9,18 @@ pub struct ToolDef {
     pub input_schema: serde_json::Value,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum StreamEvent {
     Text(String),
     ToolCall {
         id: String,
         name: String,
         args: serde_json::Value,
+    },
+    ToolResult {
+        id: String,
+        name: String,
+        result: serde_json::Value,
     },
     Usage {
         input_tokens: u64,
@@ -32,7 +37,7 @@ pub enum ProviderKind {
 
 impl ProviderKind {
     pub fn from_env() -> Self {
-        match std::env::var("KALICODE_PROVIDER")
+        match std::env::var("BARONG_PROVIDER")
             .unwrap_or_default()
             .to_lowercase()
             .as_str()
@@ -78,7 +83,7 @@ impl OpenAIProvider {
     pub fn from_env() -> Self {
         Self {
             api_key: std::env::var("OPENAI_API_KEY")
-                .or_else(|_| std::env::var("KALICODE_API_KEY"))
+                .or_else(|_| std::env::var("BARONG_API_KEY"))
                 .unwrap_or_default(),
             model: std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".into()),
             base_url: std::env::var("OPENAI_BASE_URL")
@@ -167,8 +172,12 @@ impl OpenAIProvider {
         }
 
         use futures::StreamExt;
+        use std::collections::BTreeMap;
         let mut stream = response.bytes_stream();
         let mut buffer = String::new();
+        // Market-standard: accumulate fragmented tool_calls by index.
+        // OpenAI streams: first chunk has id+name, following chunks only arguments deltas.
+        let mut pending: BTreeMap<u64, (String, String, String)> = BTreeMap::new();
 
         while let Some(chunk) = stream.next().await {
             let bytes = chunk?;
@@ -203,32 +212,27 @@ impl OpenAIProvider {
                                     }
                                     if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
                                         for call in tool_calls {
-                                            let func = call.get("function");
-                                            let name = func
-                                                .and_then(|f| f.get("name"))
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or("")
-                                                .to_string();
-                                            let args = func
-                                                .and_then(|f| f.get("arguments"))
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or("{}");
-                                            if !name.is_empty() {
-                                                let id = call
-                                                    .get("id")
-                                                    .and_then(|v| v.as_str())
-                                                    .unwrap_or("")
-                                                    .to_string();
-                                                let parsed_args: serde_json::Value =
-                                                    serde_json::from_str(args)
-                                                        .unwrap_or(serde_json::json!({}));
-                                                let _ = tx
-                                                    .send(StreamEvent::ToolCall {
-                                                        id,
-                                                        name,
-                                                        args: parsed_args,
-                                                    })
-                                                    .await;
+                                            let idx = call.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                                            let entry = pending.entry(idx).or_insert_with(|| (String::new(), String::new(), String::new()));
+                                            if let Some(id) = call.get("id").and_then(|v| v.as_str()) {
+                                                if !id.is_empty() {
+                                                    entry.0 = id.to_string();
+                                                }
+                                            }
+                                            if let Some(func) = call.get("function") {
+                                                if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+                                                    // name usually arrives whole once; append defensively
+                                                    if !name.is_empty() && entry.1 != name {
+                                                        if entry.1.is_empty() {
+                                                            entry.1 = name.to_string();
+                                                        } else {
+                                                            entry.1.push_str(name);
+                                                        }
+                                                    }
+                                                }
+                                                if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
+                                                    entry.2.push_str(args);
+                                                }
                                             }
                                         }
                                     }
@@ -239,6 +243,25 @@ impl OpenAIProvider {
                 }
             }
             buffer.drain(..processed);
+        }
+
+        // Emit accumulated tool calls (sorted by index for determinism).
+        for (idx, (mut id, name, args_str)) in pending {
+            if name.is_empty() {
+                continue;
+            }
+            if id.is_empty() {
+                id = format!("call_{}", idx);
+            }
+            let parsed_args: serde_json::Value =
+                serde_json::from_str(&args_str).unwrap_or(serde_json::json!({}));
+            let _ = tx
+                .send(StreamEvent::ToolCall {
+                    id,
+                    name,
+                    args: parsed_args,
+                })
+                .await;
         }
 
         Ok(())
@@ -255,7 +278,7 @@ impl AnthropicProvider {
     pub fn from_env() -> Self {
         Self {
             api_key: std::env::var("ANTHROPIC_API_KEY")
-                .or_else(|_| std::env::var("KALICODE_API_KEY"))
+                .or_else(|_| std::env::var("BARONG_API_KEY"))
                 .unwrap_or_default(),
             model: std::env::var("ANTHROPIC_MODEL")
                 .unwrap_or_else(|_| "claude-sonnet-4-20250514".into()),

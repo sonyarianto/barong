@@ -19,7 +19,7 @@ impl SessionManager {
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
             .unwrap_or_else(|_| ".".into());
-        let dir = PathBuf::from(home).join(".kalicode").join("sessions");
+        let dir = PathBuf::from(&home).join(".barong").join("sessions");
         let _ = std::fs::create_dir_all(&dir);
         Self { dir }
     }
@@ -29,15 +29,56 @@ impl SessionManager {
     }
 
     pub fn most_recent_session(&self) -> Option<Session> {
-        let mut entries: Vec<_> = std::fs::read_dir(&self.dir).ok()?
-            .flatten()
-            .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
-            .collect();
-        entries.sort_by_key(|e| e.path().metadata().ok().map(|m| m.modified().ok()));
-        entries.reverse();
-        let latest = entries.first()?;
-        let content = std::fs::read_to_string(latest.path()).ok()?;
-        serde_json::from_str(&content).ok()
+        let mut list = self.list_sessions();
+        list.sort_by(|a, b| b.updated.cmp(&a.updated));
+        list.into_iter().next()
+    }
+
+    pub fn list_sessions(&self) -> Vec<Session> {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return vec![];
+        };
+        let mut out = Vec::new();
+        for e in entries.flatten() {
+            if e.path().extension().is_some_and(|ext| ext == "json") {
+                if let Ok(content) = std::fs::read_to_string(e.path()) {
+                    if let Ok(s) = serde_json::from_str::<Session>(&content) {
+                        out.push(s);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    pub fn load(&self, id_or_prefix: &str) -> Option<Session> {
+        // exact, then prefix match
+        let path = self.session_path(id_or_prefix);
+        if path.exists() {
+            if let Ok(c) = std::fs::read_to_string(&path) {
+                if let Ok(s) = serde_json::from_str::<Session>(&c) {
+                    return Some(s);
+                }
+            }
+        }
+        for s in self.list_sessions() {
+            if s.id.starts_with(id_or_prefix) {
+                return Some(s);
+            }
+        }
+        None
+    }
+
+    pub fn export_jsonl(&self, id: &str, dest: &std::path::Path) -> anyhow::Result<()> {
+        let content = std::fs::read_to_string(self.session_path(id))?;
+        let session: Session = serde_json::from_str(&content)?;
+        let mut out = String::new();
+        for m in &session.messages {
+            out.push_str(&serde_json::to_string(m)?);
+            out.push('\n');
+        }
+        std::fs::write(dest, out)?;
+        Ok(())
     }
 
     pub fn save(&self, messages: &[Message]) -> String {

@@ -9,6 +9,10 @@ pub struct Config {
     pub base_url: Option<String>,
     pub max_tokens: Option<u32>,
     pub theme: Option<String>,
+    /// Opt-in extras beyond core (read/write/edit/bash).
+    /// e.g. ["grep", "glob", "delegate", "all"]
+    #[serde(default)]
+    pub extra_tools: Vec<String>,
     #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
 }
@@ -24,8 +28,8 @@ pub struct McpServerConfig {
 impl Config {
     pub fn load() -> Self {
         let paths = [
-            Path::new("kalicode.jsonc"),
-            Path::new("kalicode.json"),
+            Path::new("barong.jsonc"),
+            Path::new("barong.json"),
         ];
 
         for path in &paths {
@@ -53,7 +57,7 @@ impl Config {
     pub fn resolve_provider(&self) -> String {
         self.provider
             .clone()
-            .or_else(|| std::env::var("KALICODE_PROVIDER").ok())
+            .or_else(|| std::env::var("BARONG_PROVIDER").ok())
             .unwrap_or_else(|| "openai".into())
     }
 
@@ -76,12 +80,12 @@ impl Config {
             .or_else(|| match provider {
                 "anthropic" => {
                     std::env::var("ANTHROPIC_API_KEY")
-                        .or_else(|_| std::env::var("KALICODE_API_KEY"))
+                        .or_else(|_| std::env::var("BARONG_API_KEY"))
                         .ok()
                 }
                 _ => {
                     std::env::var("OPENAI_API_KEY")
-                        .or_else(|_| std::env::var("KALICODE_API_KEY"))
+                        .or_else(|_| std::env::var("BARONG_API_KEY"))
                         .ok()
                 }
             })
@@ -98,6 +102,21 @@ impl Config {
     pub fn resolve_max_tokens(&self) -> u32 {
         self.max_tokens.unwrap_or(4096)
     }
+
+    pub fn resolve_extra_tools(&self) -> Vec<String> {
+        if self.extra_tools.is_empty() {
+            // Env override: BARONG_EXTRA_TOOLS="grep,glob,delegate" or "all"
+            if let Ok(raw) = std::env::var("BARONG_EXTRA_TOOLS")
+            {
+                return raw
+                    .split([',', ' '])
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .collect();
+            }
+        }
+        self.extra_tools.clone()
+    }
 }
 
 #[cfg(test)]
@@ -105,11 +124,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_load_config() {
-        let cfg = Config::load();
+    fn test_resolve_defaults() {
+        let cfg = Config::default();
         assert_eq!(cfg.resolve_provider(), "openai");
-        assert_eq!(cfg.resolve_base_url(), "https://openrouter.ai/api/v1");
-        assert_eq!(cfg.resolve_model("openai"), "openrouter/free");
+        assert_eq!(cfg.resolve_base_url(), "https://api.openai.com/v1");
+        assert_eq!(cfg.resolve_model("openai"), "gpt-4o");
+        assert!(cfg.resolve_extra_tools().is_empty());
+    }
+
+    #[test]
+    fn test_extra_tools_env() {
+        std::env::set_var("BARONG_EXTRA_TOOLS", "grep,glob");
+        let cfg = Config::default();
+        let extras = cfg.resolve_extra_tools();
+        assert!(extras.contains(&"grep".to_string()));
+        std::env::remove_var("BARONG_EXTRA_TOOLS");
     }
 }
 

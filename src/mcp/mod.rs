@@ -37,7 +37,7 @@ impl McpServer {
         let req = self.build_request("initialize", serde_json::json!({
             "protocolVersion": "2025-03-26",
             "capabilities": {},
-            "clientInfo": { "name": "kalicode", "version": "0.1.0" },
+            "clientInfo": { "name": "barong", "version": "0.1.0" },
         }));
         self.send(&req)?;
         let _resp = self.read_response()?;

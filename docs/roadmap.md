@@ -1,4 +1,4 @@
-# KaliCode Roadmap
+# Barong Roadmap
 
 ## Phase 0: Skeleton
 - [x] Define architecture & design docs

@@ -9,7 +9,11 @@ pub struct WriteFile;
 #[async_trait]
 impl Tool for WriteFile {
     fn name(&self) -> &str {
-        "write_file"
+        "write"
+    }
+
+    fn aliases(&self) -> &[&str] {
+        &["write_file"]
     }
 
     fn description(&self) -> &str {
@@ -20,27 +24,38 @@ impl Tool for WriteFile {
         serde_json::json!({
             "type": "object",
             "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The path to the file to write (alias: file_path)"
+                },
                 "file_path": {
                     "type": "string",
-                    "description": "The path to the file to write"
+                    "description": "Deprecated alias for path"
                 },
                 "content": {
                     "type": "string",
                     "description": "The content to write to the file"
                 }
             },
-            "required": ["file_path", "content"]
+            "required": ["content"]
         })
     }
 
     async fn call(&self, args: Value, _tx: Option<mpsc::Sender<StreamEvent>>) -> Result<Value> {
-        let path = args["file_path"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("missing file_path"))?;
+        let path = args
+            .get("path")
+            .or_else(|| args.get("file_path"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("missing path (or file_path)"))?;
         let content = args["content"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing content"))?;
 
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+        }
         tokio::fs::write(path, content).await?;
         Ok(serde_json::json!({ "success": true }))
     }

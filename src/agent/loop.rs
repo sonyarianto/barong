@@ -13,8 +13,20 @@ pub async fn start_agent_loop(
     tx: mpsc::Sender<StreamEvent>,
     cancelled: Arc<AtomicBool>,
 ) {
+    start_agent_loop_with_limit(provider, messages, tools, tool_registry, tx, cancelled, 25).await;
+}
+
+pub async fn start_agent_loop_with_limit(
+    provider: Box<dyn LLMProvider>,
+    messages: Vec<Message>,
+    tools: Vec<ToolDef>,
+    tool_registry: Arc<ToolRegistry>,
+    tx: mpsc::Sender<StreamEvent>,
+    cancelled: Arc<AtomicBool>,
+    max_iterations: u32,
+) {
     let mut iteration = 0u32;
-    let max_iterations = 25u32;
+    let max_iterations = max_iterations.clamp(1, 100);
     let mut all_messages = messages;
 
     while iteration < max_iterations && !cancelled.load(Ordering::Relaxed) {
@@ -40,7 +52,14 @@ pub async fn start_agent_loop(
                     let _ = tx.send(StreamEvent::Text(token)).await;
                 }
                 StreamEvent::ToolCall { id, name, args } => {
-                    tool_calls.push((id, name, args));
+                    tool_calls.push((id.clone(), name.clone(), args.clone()));
+                    // Forward structured event for TUI + JSON/RPC modes.
+                    let _ = tx
+                        .send(StreamEvent::ToolCall { id, name, args })
+                        .await;
+                }
+                StreamEvent::ToolResult { id, name, result } => {
+                    let _ = tx.send(StreamEvent::ToolResult { id, name, result }).await;
                 }
                 StreamEvent::Usage { input_tokens, output_tokens } => {
                     let _ = tx
@@ -89,15 +108,6 @@ pub async fn start_agent_loop(
             break;
         }
 
-        let calls_for_spawn = tool_calls.clone();
-        let tx_clone = tx.clone();
-        tokio::spawn(async move {
-            for (_id, name, args) in calls_for_spawn {
-                let content = format!("▸ **{}** `{}`", name, args);
-                let _ = tx_clone.send(StreamEvent::Text(content)).await;
-            }
-        });
-
         for (id, name, args) in &tool_calls {
             if cancelled.load(Ordering::Relaxed) {
                 break;
@@ -105,10 +115,11 @@ pub async fn start_agent_loop(
 
             if let Some(tool) = tool_registry.get(name) {
                 let result = tool.call(args.clone(), Some(tx.clone())).await;
-                let content = match result {
-                    Ok(output) => serde_json::to_string_pretty(&output).unwrap_or_default(),
-                    Err(e) => format!("Error: {}", e),
+                let value = match result {
+                    Ok(output) => output,
+                    Err(e) => serde_json::json!({ "error": e.to_string() }),
                 };
+                let content = serde_json::to_string_pretty(&value).unwrap_or_default();
                 all_messages.push(Message {
                     role: "tool".into(),
                     content: Some(content.clone()),
@@ -116,11 +127,29 @@ pub async fn start_agent_loop(
                     tool_call_id: Some(id.clone()),
                 });
 
-                let result_event = StreamEvent::Text(format!(
-                    "\n{}",
-                    summarize_result(name, &content, 3)
-                ));
-                let _ = tx.send(result_event).await;
+                // Structured result for JSON/RPC + TUI rendering.
+                let _ = tx
+                    .send(StreamEvent::ToolResult {
+                        id: id.clone(),
+                        name: name.clone(),
+                        result: value,
+                    })
+                    .await;
+            } else {
+                let err = serde_json::json!({ "error": format!("unknown tool: {}", name) });
+                all_messages.push(Message {
+                    role: "tool".into(),
+                    content: Some(err.to_string()),
+                    tool_calls: None,
+                    tool_call_id: Some(id.clone()),
+                });
+                let _ = tx
+                    .send(StreamEvent::ToolResult {
+                        id: id.clone(),
+                        name: name.clone(),
+                        result: err,
+                    })
+                    .await;
             }
         }
     }
@@ -128,7 +157,7 @@ pub async fn start_agent_loop(
     let _ = tx.send(StreamEvent::Done).await;
 }
 
-fn summarize_result(tool: &str, content: &str, max_lines: usize) -> String {
+pub fn summarize_result(tool: &str, content: &str, max_lines: usize) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let total_lines = lines.len();
 

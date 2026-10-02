@@ -1,8 +1,8 @@
-# KaliCode Architecture
+# Barong Architecture
 
 ## Overview
 
-KaliCode is a terminal-based coding agent built in Rust using Ratatui and Crossterm.
+Barong is a terminal-based coding agent built in Rust using Ratatui and Crossterm.
 It follows the standard agent loop pattern: **User Input → LLM Reasoning → Tool Execution → Result → Repeat**.
 
 ## System Architecture

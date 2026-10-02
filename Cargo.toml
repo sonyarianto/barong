@@ -1,8 +1,8 @@
 [package]
-name = "kalicode"
+name = "barong"
 version = "0.1.0"
 edition = "2021"
-description = "A terminal-based coding agent built with Rust"
+description = "Barong — a terminal-based coding agent built with Rust"
 
 [dependencies]
 ratatui = "0.29"
@@ -16,4 +16,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures = "0.3"
 async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }

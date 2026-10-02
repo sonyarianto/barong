@@ -1,4 +1,4 @@
-# KaliCode Design Decisions
+# Barong Design Decisions
 
 ## Why Rust?
 

@@ -7,5 +7,5 @@ Thumbs.db
 *.log
 .env
 .env.*
-kalicode.jsonc
-kalicode.json
+barong.jsonc
+barong.json

@@ -13,6 +13,30 @@ static IGNORE_DIRS: &[&str] = &[
     "__pycache__", ".venv", "vendor", ".expo",
 ];
 
+/// Project instructions. Checks git root + cwd, capped to ~4k chars.
+pub fn load_agents_md(root: &std::path::Path) -> Option<String> {
+    let candidates = [
+        root.join("AGENTS.md"),
+        std::env::current_dir().unwrap_or_default().join("AGENTS.md"),
+    ];
+    for p in candidates {
+        if let Ok(raw) = std::fs::read_to_string(&p) {
+            let trimmed = raw.trim().to_string();
+            if trimmed.is_empty() {
+                continue;
+            }
+            // cap ~4000 chars to protect context window
+            let capped = if trimmed.len() > 4000 {
+                format!("{}…\n[truncated {} chars]", &trimmed[..4000], trimmed.len() - 4000)
+            } else {
+                trimmed
+            };
+            return Some(capped);
+        }
+    }
+    None
+}
+
 impl WorkspaceContext {
     pub fn new() -> Self {
         let root = Self::find_git_root().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
@@ -127,6 +151,11 @@ impl WorkspaceContext {
                     parts.push(format!("  {}", line));
                 }
             }
+        }
+
+        if let Some(agents) = load_agents_md(&self.root) {
+            parts.push("\n## Project instructions (AGENTS.md)".into());
+            parts.push(agents);
         }
 
         parts.push("\nFile tree:".into());

@@ -13,7 +13,7 @@ impl Tool for Glob {
     }
 
     fn description(&self) -> &str {
-        "List files recursively matching a path pattern. Use this to discover project structure."
+        "List files matching a pattern (extra tool: prefer read <dir> or bash)."
     }
 
     fn schema(&self) -> Value {
@@ -37,28 +37,58 @@ impl Tool for Glob {
         let pattern = args["pattern"].as_str().unwrap_or("*");
         let search_path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
 
-        let output = tokio::process::Command::new("pwsh")
-            .args([
-                "-NoProfile",
-                "-Command",
-                &format!(
-                    "Get-ChildItem -Path '{}' -Recurse -Filter '{}' -Force -ErrorAction SilentlyContinue \
-                     | Where-Object {{ !$_.PSIsContainer }} \
-                     | Resolve-Path -Relative \
-                     | ForEach-Object {{ $_ -replace '^\\\\\\.\\\\', '' }}",
-                    search_path, pattern
-                ),
-            ])
-            .output()
-            .await?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let files: Vec<String> = stdout
-            .lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty())
-            .collect();
-
+        let files = walk_filtered(std::path::Path::new(search_path), pattern, 500)?;
         Ok(serde_json::json!({ "files": files }))
     }
+}
+
+fn matches(name: &str, pattern: &str) -> bool {
+    if pattern == "*" || pattern.is_empty() {
+        return true;
+    }
+    if let Some(ext) = pattern.strip_prefix("*.") {
+        // support "*.rs" and "*.{ts,tsx}"
+        if ext.starts_with('{') && ext.ends_with('}') {
+            let inner = &ext[1..ext.len() - 1];
+            return inner.split(',').any(|e| name.ends_with(e.trim()));
+        }
+        return name.ends_with(ext);
+    }
+    if pattern.starts_with('*') && pattern.ends_with('*') && pattern.len() > 1 {
+        return name.contains(&pattern[1..pattern.len() - 1]);
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return name.starts_with(prefix);
+    }
+    name.contains(pattern)
+}
+
+fn walk_filtered(dir: &std::path::Path, pattern: &str, cap: usize) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let entries = match std::fs::read_dir(&d) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for e in entries.flatten() {
+            if out.len() >= cap {
+                break;
+            }
+            let path = e.path();
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') || name == "target" || name == "node_modules" {
+                if path.is_dir() {
+                    continue;
+                }
+            }
+            if path.is_dir() {
+                stack.push(path);
+            } else if matches(&name, pattern) {
+                out.push(path.to_string_lossy().to_string());
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
 }

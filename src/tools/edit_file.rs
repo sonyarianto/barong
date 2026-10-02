@@ -9,7 +9,11 @@ pub struct EditFile;
 #[async_trait]
 impl Tool for EditFile {
     fn name(&self) -> &str {
-        "edit_file"
+        "edit"
+    }
+
+    fn aliases(&self) -> &[&str] {
+        &["edit_file"]
     }
 
     fn description(&self) -> &str {
@@ -20,9 +24,13 @@ impl Tool for EditFile {
         serde_json::json!({
             "type": "object",
             "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The path to the file to edit (alias: file_path)"
+                },
                 "file_path": {
                     "type": "string",
-                    "description": "The path to the file to edit"
+                    "description": "Deprecated alias for path"
                 },
                 "old_string": {
                     "type": "string",
@@ -33,14 +41,16 @@ impl Tool for EditFile {
                     "description": "The text to replace it with"
                 }
             },
-            "required": ["file_path", "old_string", "new_string"]
+            "required": ["old_string", "new_string"]
         })
     }
 
     async fn call(&self, args: Value, _tx: Option<mpsc::Sender<StreamEvent>>) -> Result<Value> {
-        let path = args["file_path"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("missing file_path"))?;
+        let path = args
+            .get("path")
+            .or_else(|| args.get("file_path"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("missing path (or file_path)"))?;
         let old = args["old_string"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing old_string"))?;

@@ -33,36 +33,43 @@ pub struct App {
     pub current_model: String,
     pub cancelled: Arc<AtomicBool>,
     pub is_home: bool,
+    // UX state (minimal)
+    pub palette_idx: usize,
+    pub tool_expanded: bool,
+    pub notice: Option<String>,
+    pub spinner_tick: usize,
 }
-
-pub const SPLASH: &str = r#"
-██╗  ██╗ █████╗ ██╗     ██╗ ██████╗ ██████╗ ██████╗ ███████╗
-██║ ██╔╝██╔══██╗██║     ██║██╔════╝██╔═══██╗██╔══██╗██╔════╝
-█████╔╝ ███████║██║     ██║██║     ██║   ██║██║  ██║█████╗  
-██╔═██╗ ██╔══██║██║     ██║██║     ██║   ██║██║  ██║██╔══╝  
-██║  ██╗██║  ██║███████╗██║╚██████╗╚██████╔╝██████╔╝███████╗
-╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚═╝ ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝
-"#;
 
 impl App {
     pub fn new() -> Self {
         let config = Config::load();
+        Self::new_with_config(config, vec![])
+    }
+
+    pub fn new_with_config(config: Config, cli_extra_tools: Vec<String>) -> Self {
         let provider_str = config.resolve_provider();
         let provider = ProviderKind::from_str(&provider_str);
         let current_model = config.resolve_model(&provider_str);
-        let mut tool_registry = ToolRegistry::new();
+        let mut extras = config.resolve_extra_tools();
+        extras.extend(cli_extra_tools);
+        let mut tool_registry = ToolRegistry::new().with_extras(&extras);
         let session_manager = SessionManager::new();
 
         let conversation = Conversation::new();
         let session_id = session_manager.most_recent_session().map(|s| s.id);
 
         let mcp_servers = Self::init_mcp(&config, &mut tool_registry);
-        tool_registry.register_delegate(
-            config.resolve_api_key(&provider_str),
-            config.resolve_model(&provider_str),
-            config.resolve_base_url(),
-            provider,
-        );
+        // delegate is opt-in extra (no sub-agents in core)
+        if extras.iter().any(|e| {
+            e.eq_ignore_ascii_case("delegate") || e.eq_ignore_ascii_case("all")
+        }) {
+            tool_registry.register_delegate(
+                config.resolve_api_key(&provider_str),
+                config.resolve_model(&provider_str),
+                config.resolve_base_url(),
+                provider,
+            );
+        }
 
         let tool_registry = Arc::new(tool_registry);
 
@@ -85,6 +92,36 @@ impl App {
             current_model: current_model.clone(),
             cancelled: Arc::new(AtomicBool::new(false)),
             is_home: true,
+            palette_idx: 0,
+            tool_expanded: false,
+            notice: None,
+            spinner_tick: 0,
+        }
+    }
+
+    /// Rough context usage 0..1 based on chars (~4 chars/token) vs 128k.
+    pub fn context_usage(&self) -> f32 {
+        let mut chars = self.workspace.file_tree.len() + self.workspace.summary().len();
+        for m in &self.conversation.messages {
+            chars += m.content.as_deref().unwrap_or("").len();
+        }
+        chars += self.streaming_text.len();
+        (chars as f32 / 4.0 / 128_000.0).clamp(0.0, 1.0)
+    }
+
+    pub fn cwd_short(&self) -> String {
+        let s = self.workspace.root.to_string_lossy().to_string();
+        if let Some(home) = std::env::var("HOME").ok() {
+            if s.starts_with(&home) {
+                return format!("~{}", &s[home.len()..]);
+            }
+        }
+        // show last 2 components for brevity
+        let parts: Vec<&str> = s.split('/').filter(|p| !p.is_empty()).collect();
+        if parts.len() > 2 {
+            format!("…/{}/{}", parts[parts.len() - 2], parts[parts.len() - 1])
+        } else {
+            s
         }
     }
 
@@ -109,9 +146,21 @@ impl App {
                             format!("in:{} out:{}", input_tokens, output_tokens);
                     }
                     Ok(StreamEvent::ToolCall { id: _, name, args }) => {
-                        let content = format!("Tool call: {} ({})", name, args);
+                        // Flush pending assistant text before tool block.
+                        if !self.streaming_text.is_empty() {
+                            let text = std::mem::take(&mut self.streaming_text);
+                            self.conversation.add_message("assistant".into(), text);
+                        }
+                        let content = format!("▸ **{}** `{}`", name, args);
                         self.conversation.add_message("tool".into(), content);
-                        self.streaming_text.clear();
+                        self.should_auto_scroll = true;
+                    }
+                    Ok(StreamEvent::ToolResult { id: _, name, result }) => {
+                        let pretty = serde_json::to_string_pretty(&result).unwrap_or_default();
+                        let summary = crate::agent::r#loop::summarize_result(&name, &pretty, 3);
+                        self.conversation
+                            .add_message("tool".into(), format!("\n{}", summary));
+                        self.should_auto_scroll = true;
                     }
                     Ok(StreamEvent::Done) => {
                         if !self.streaming_text.is_empty() {

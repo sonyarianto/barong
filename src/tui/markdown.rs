@@ -13,11 +13,11 @@ impl MarkdownRenderer {
         let mut lines = Vec::new();
 
         let prefix = match role {
-            "user" => Span::styled("You  ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            "assistant" => Span::styled("Kali ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-            "system" => Span::styled("Sys  ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            "tool" => Span::raw("     "),
-            _ => Span::raw("     "),
+            "user" => Span::styled("› ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            "assistant" => Span::raw(""),
+            "system" => Span::styled("! ", Style::default().fg(Color::Yellow)),
+            "tool" => Span::raw(""),
+            _ => Span::raw(""),
         };
 
         let mut in_code_block = false;
