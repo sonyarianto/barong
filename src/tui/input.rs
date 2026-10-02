@@ -756,6 +756,29 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
                 }
                 app.model_navigated = false;
                 app.model_idx = 0;
+            } else if let Some(pid) = app
+                .config
+                .all_provider_ids()
+                .into_iter()
+                .find(|id| id.eq_ignore_ascii_case(arg.trim()))
+            {
+                // Bare provider id (`/model nvidia`) → switch provider, default model.
+                let def = app.config.resolve_default_model(&pid);
+                match app.apply_provider_model(&pid, &def) {
+                    Ok(_) => {
+                        let (k, _) = crate::auth::resolve_api_key(&pid, &app.auth, &app.config);
+                        let warn = if k.is_empty() {
+                            " (no key yet — `/login` to activate)".to_string()
+                        } else {
+                            String::new()
+                        };
+                        app.conversation.add_message(
+                            "assistant".into(),
+                            format!("**Model set to:** `{}/{}`{}", pid, def, warn),
+                        );
+                    }
+                    Err(e) => app.conversation.add_message("assistant".into(), e),
+                }
             } else if let Some((p, m)) = app.parse_model_arg(arg) {
                 let items = model_entries(app, arg);
                 // Exact catalog hit, or unambiguous single match.
@@ -1087,7 +1110,6 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
         }
     }
 }
-
 fn copy_to_clipboard(text: &str) -> bool {
     for (cmd, args) in [
         ("wl-copy", vec![]),
@@ -1106,4 +1128,62 @@ fn copy_to_clipboard(text: &str) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    /// App isolated from the real ~/.barong (temp HOME + throwaway key).
+    fn test_app() -> App {
+        let tmp = std::env::temp_dir().join(format!("barong-model-repro-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let orig = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &tmp);
+        let app = App::new_with_config(Config::default(), vec![]);
+        match orig {
+            Some(o) => std::env::set_var("HOME", o),
+            None => std::env::remove_var("HOME"),
+        }
+        app
+    }
+
+    #[test]
+    fn model_bare_provider_switches_with_default() {
+        let mut app = test_app();
+        app.auth.set("nvidia", "nvapi-test-key");
+        assert_eq!(app.provider_name, "openai");
+        handle_slash(&mut app, "/model nvidia").unwrap();
+        assert_eq!(app.provider_name, "nvidia", "bare provider id must switch provider");
+        assert_eq!(app.current_model, "deepseek-ai/deepseek-r1");
+    }
+
+    #[test]
+    fn model_full_id_switches_provider() {
+        let mut app = test_app();
+        app.auth.set("nvidia", "nvapi-test-key");
+        handle_slash(&mut app, "/model nvidia/deepseek-ai/deepseek-r1").unwrap();
+        assert_eq!(app.provider_name, "nvidia");
+        assert_eq!(app.current_model, "deepseek-ai/deepseek-r1");
+    }
+
+    #[test]
+    fn model_unprefixed_known_id_switches_provider() {
+        let mut app = test_app();
+        app.auth.set("nvidia", "nvapi-test-key");
+        handle_slash(&mut app, "/model deepseek-ai/deepseek-r1").unwrap();
+        assert_eq!(app.provider_name, "nvidia");
+        assert_eq!(app.current_model, "deepseek-ai/deepseek-r1");
+    }
+
+    #[test]
+    fn model_navigated_applies_highlight() {
+        let mut app = test_app();
+        app.auth.set("nvidia", "nvapi-test-key");
+        app.model_navigated = true;
+        app.model_idx = 0;
+        handle_slash(&mut app, "/model nvid").unwrap();
+        assert_eq!(app.provider_name, "nvidia", "highlighted entry must win");
+    }
 }
