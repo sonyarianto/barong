@@ -119,12 +119,18 @@ impl Config {
             "9router" => Some(("openai", "http://localhost:20128/v1",
                 &["kr/claude-sonnet-4.5", "cc/claude-opus-4-5"],
                 "NINEROUTER_API_KEY", true)),
+            // Token Harbor: one universal key (thk_…) for all vendors,
+            // OpenAI- + Anthropic-compatible. `:free` ids never charge.
+            // Catalog from their quickstart; discovery fills the rest on login.
+            "tokenharbor" => Some(("openai", "https://tokenharbor.ai/v1",
+                &["deepseek-v4.1-flash", "claude-opus-5", "openai/gpt-4o-mini"],
+                "TOKENHARBOR_API_KEY", true)),
             _ => None,
         }
     }
 
     pub fn known_provider_ids() -> Vec<&'static str> {
-        vec!["openai", "anthropic", "openrouter", "deepseek", "nvidia", "ollama", "9router"]
+        vec!["openai", "anthropic", "openrouter", "deepseek", "nvidia", "ollama", "9router", "tokenharbor"]
     }
 
     /// All provider ids: built-ins plus user-defined in config.
@@ -335,7 +341,14 @@ mod tests {
         assert_eq!(r.api, "openai");
         assert_eq!(r.base_url, "http://localhost:20128/v1");
         assert_eq!(cfg.resolve_default_model("9router"), "kr/claude-sonnet-4.5");
-        assert!(cfg.all_provider_ids().contains(&"9router".to_string()));        // Unknown provider: openai-flavored, empty base/models.
+        assert!(cfg.all_provider_ids().contains(&"9router".to_string()));
+        // Token Harbor: universal key gateway, coder default.
+        let th = cfg.resolve_provider_config("tokenharbor");
+        assert_eq!(th.api, "openai");
+        assert_eq!(th.base_url, "https://tokenharbor.ai/v1");
+        assert_eq!(cfg.resolve_default_model("tokenharbor"), "deepseek-v4.1-flash");
+        assert!(cfg.all_provider_ids().contains(&"tokenharbor".to_string()));
+        // Unknown provider: openai-flavored, empty base/models.
         let x = cfg.resolve_provider_config("acme");
         assert!(!x.known);
         assert_eq!(cfg.resolve_default_model("deepseek"), "deepseek-chat");
