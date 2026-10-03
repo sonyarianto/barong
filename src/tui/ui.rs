@@ -389,7 +389,8 @@ fn truncate_middle(s: &str, max: usize) -> String {
 fn prompt_box_rows(app: &App, area_width: u16) -> u16 {
     let inner = area_width.saturating_sub(PROMPT_INSET).max(8);
     let draft = crate::tui::wrap::text_rows(&prompt_draft_text(app), inner) as u16;
-    draft.saturating_add(2).clamp(3, MAX_PROMPT_ROWS)
+    // draft + breathing row + endpoint row + a pad above and below
+    draft.saturating_add(4).clamp(5, MAX_PROMPT_ROWS + 4)
 }
 
 /// What the prompt line shows. An empty prompt is nothing but the block
@@ -432,15 +433,22 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
     }
     let t = &app.theme;
     let inner_w = area.width.saturating_sub(PROMPT_INSET).max(1);
-    let draft_text = prompt_draft_text(app);
-    let rows = crate::tui::wrap::wrap_text(&draft_text, inner_w);
+    let rows = crate::tui::wrap::wrap_text(&prompt_draft_text(app), inner_w);
     let height = area.height;
     let endpoint = EndpointLine::build(app);
 
-    // Keep the cursor on the last visible row when the draft outgrows the box.
+    // Box anatomy: blank, draft…, blank, endpoint, blank. The pads are what
+    // makes it read as a container instead of text stuck to the status line.
+    let last = height.saturating_sub(1); // bottom pad
+    let endpoint_row = last.saturating_sub(1);
+    let breath_row = endpoint_row.saturating_sub(1);
+    let first = 1u16; // top pad
+    let visible = breath_row.saturating_sub(first).max(1);
+
+    // Keep the cursor on the last visible draft row when it outgrows the box.
     let cursor_row = prompt_cursor_row(app, inner_w);
     let scroll = cursor_row
-        .saturating_sub(height.saturating_sub(3))
+        .saturating_sub(visible.saturating_sub(1))
         .min((rows.len() as u16).saturating_sub(1));
 
     // An empty prompt is just the cursor, so paint it like one.
@@ -450,23 +458,18 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
         Style::default().bg(t.panel).fg(Color::Reset)
     };
     let bar = Style::default().fg(t.accent).bg(t.panel);
+    let pad_bg = Style::default().bg(t.panel);
 
     for row in 0..height {
-        // Last two rows are the breathing row and the endpoint row.
-        let text = if row + 2 >= height {
-            String::new()
-        } else {
-            rows.get((scroll + row) as usize)
-                .cloned()
-                .unwrap_or_default()
-        };
-        let mut spans = vec![
-            Span::styled("\u{258c} ", bar),
-            Span::styled(text, draft_style),
-        ];
-        if row + 1 == height {
-            // Endpoint row lives inside the box, hard left.
-            let mut line = endpoint.spans(area.width.saturating_sub(PROMPT_INSET), t);
+        let mut spans = vec![Span::styled("\u{258c} ", bar)];
+        if row == endpoint_row {
+            // Endpoint lives inside the box, hard left. Every span carries the
+            // panel background — without it the text sits on the terminal's
+            // default background and the box shows a pale band.
+            let mut line = endpoint.spans(inner_w, t);
+            for span in line.iter_mut() {
+                *span = Span::styled(span.content.clone(), span.style.bg(t.panel));
+            }
             let used: usize = 2 + line
                 .iter()
                 .map(|s| display_cells(&s.content))
@@ -474,13 +477,21 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
             spans.append(&mut line);
             spans.push(Span::styled(
                 " ".repeat((area.width as usize).saturating_sub(used)),
-                Style::default().bg(t.panel),
+                pad_bg,
             ));
         } else {
+            let text = if row < first || row >= breath_row {
+                String::new()
+            } else {
+                rows.get((scroll + row - first) as usize)
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            spans.push(Span::styled(text, draft_style));
             let used = 2 + display_cells(&spans[1].content) as usize;
             spans.push(Span::styled(
                 " ".repeat((area.width as usize).saturating_sub(used)),
-                Style::default().bg(t.panel),
+                pad_bg,
             ));
         }
         frame.render_widget(

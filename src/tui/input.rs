@@ -1812,26 +1812,49 @@ mod tests {
         app.input.set_cursor(app.input.buffer.len());
         let rows = draw_cells(&mut app, 80, 24);
         let prompt = prompt_box(&rows, 24);
-        // draft + breathing row + endpoint row
-        assert_eq!(prompt.len(), 3, "{:?}", prompt);
-        assert!(prompt[0].contains("read @src/main.rs"), "draft: {:?}", prompt);
-        assert!(prompt[1].trim_start_matches('\u{258c}').trim().is_empty(), "breathing row: {:?}", prompt);
+        // pad + draft + breathing + endpoint + pad
+        assert_eq!(prompt.len(), 5, "{:?}", prompt);
+        assert_box_shape(&prompt, "idle prompt");
+        assert!(
+            prompt[1].contains("read @src/main.rs"),
+            "draft: {:?}",
+            prompt
+        );
         // The endpoint row lives inside the box, like OpenCode's agent/model line.
         let endpoint = endpoint_row(&rows, 24);
-        assert!(endpoint.contains(&app.provider_name), "provider: {:?}", endpoint);
-        assert!(endpoint.contains(&app.current_model), "model: {:?}", endpoint);
+        assert!(
+            endpoint.contains(&app.provider_name),
+            "provider: {:?}",
+            endpoint
+        );
+        assert!(
+            endpoint.contains(&app.current_model),
+            "model: {:?}",
+            endpoint
+        );
         assert!(
             endpoint.contains(if app.permission_gate.auto_approve() { "auto" } else { "ask" }),
             "mode: {:?}",
             endpoint
         );
-        // No leftover rule row: the status line follows the box directly.
+        // The status line follows the box directly, with no rule in between.
         let status = status_line(&rows, 24);
         assert!(status.contains("msgs"), "status: {:?}", status);
         assert!(status.contains('(') && status.contains('%'), "gauge: {:?}", status);
         assert!(!status.contains("dark"), "theme name is not daily-use info: {:?}", status);
-        // The draft area carries the panel background.
-        assert_eq!(rows[21][3].bg, app.theme.panel);
+        // Every row of the box carries the panel background — including the
+        // endpoint row, which used to sit on the terminal default and showed
+        // as a pale band across the box.
+        for line in rows.iter().rev().skip(1).take(5) {
+            for cell in line.iter().take(70) {
+                assert_eq!(
+                    cell.bg,
+                    app.theme.panel,
+                    "box row must be panel-coloured, got {:?}",
+                    cell.bg
+                );
+            }
+        }
     }
 
     #[test]
@@ -1889,10 +1912,21 @@ mod tests {
             .collect()
     }
 
-    /// The endpoint row: the last row of the box, naming provider/model/mode.
+    /// Assert the box anatomy: pad, draft…, breathing row, endpoint, pad.
+    fn assert_box_shape(box_rows: &[String], what: &str) {
+        assert!(box_rows.len() >= 5, "{}: {} rows: {:?}", what, box_rows.len(), box_rows);
+        let bare = |i: usize| box_rows[i].trim_start_matches('\u{258c}').trim().is_empty();
+        assert!(bare(0), "{}: top pad missing: {:?}", what, box_rows);
+        assert!(!bare(1), "{}: draft row is empty: {:?}", what, box_rows);
+        assert!(bare(2), "{}: breathing row missing: {:?}", what, box_rows);
+        assert!(!bare(3), "{}: endpoint row is empty: {:?}", what, box_rows);
+        assert!(bare(4), "{}: bottom pad missing: {:?}", what, box_rows);
+    }
+
+    /// The endpoint row: the second-to-last row of the box.
     fn endpoint_row(rows: &[Vec<ratatui::buffer::Cell>], h: u16) -> String {
         prompt_box(rows, h)
-            .last()
+            .get(prompt_box(rows, h).len().saturating_sub(2))
             .cloned()
             .unwrap_or_default()
             .trim_start_matches('\u{258c}')
@@ -2077,9 +2111,10 @@ mod tests {
         app.input.set_cursor(app.input.buffer.len());
         let rows = draw_cells(&mut app, 60, 16);
         let prompt = prompt_box(&rows, 16);
-        assert_eq!(prompt.len(), 3, "{:?}", prompt);
-        assert!(prompt[0].contains("draft while busy"), "draft visible: {:?}", prompt);
-        assert!(prompt[0].contains('\u{2588}'), "cursor visible: {:?}", prompt);
+        assert_eq!(prompt.len(), 5, "{:?}", prompt);
+        assert_box_shape(&prompt, "busy prompt");
+        assert!(prompt[1].contains("draft while busy"), "draft visible: {:?}", prompt);
+        assert!(prompt[1].contains('\u{2588}'), "cursor visible: {:?}", prompt);
         // No instructional text crammed into the box.
         let whole = prompt.join(" ");
         assert!(!whole.contains("Esc to cancel"), "box must stay clean: {:?}", whole);
@@ -2400,14 +2435,17 @@ mod tests {
                     h
                 ),
             }
-            // The prompt row keeps its own content.
-            let first = row_text(&rows, box_top);
+            // The draft row keeps its own content.
+            let draft = (box_top..box_top + 5)
+                .map(|y| row_text(&rows, y))
+                .find(|l| l.contains("/model"))
+                .unwrap_or_default();
             assert!(
-                first.contains("/model"),
+                draft.contains("/model"),
                 "prompt must still show the draft at {}x{}: {:?}",
                 w,
                 h,
-                first
+                draft
             );
         }
     }
@@ -2484,15 +2522,15 @@ mod tests {
         let mut app = test_app();
         let rows = draw_cells(&mut app, 80, 24);
         let prompt = prompt_box(&rows, 24);
-        assert_eq!(prompt.len(), 3, "{:?}", prompt);
+        assert_eq!(prompt.len(), 5, "{:?}", prompt);
+        assert_box_shape(&prompt, "empty prompt");
         // No affordance hints anywhere in the input area.
         let whole = prompt.join(" ");
         for hint in ["message", "commands", "@ files", "Esc cancel"] {
             assert!(!whole.contains(hint), "prompt must not hint {:?}: {:?}", hint, whole);
         }
-        // The cursor is there and it is the only thing on the row.
-        assert!(prompt[0].contains('\u{2588}'), "cursor: {:?}", prompt);
-        let text: String = prompt[0].trim_start_matches('\u{258c}').to_string();
+        // The cursor is there and it is the only thing on its row.
+        let text = prompt[1].trim_start_matches('\u{258c}').to_string();
         assert_eq!(text.trim(), "\u{2588}", "just the cursor: {:?}", text);
         // Nor on the welcome screen.
         assert!(!chat_rows(&rows, 24).join(" ").contains("Type a message"));
@@ -3037,6 +3075,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
 
 
 
