@@ -1057,48 +1057,7 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                 }
             }
             KeyCode::Enter => {
-                // Shift+Enter = newline (needs kitty keyboard enhancement,
-                // pushed in main; plain terminals keep sending plain Enter).
-                if is_shift_enter(key) {
-                    app.input.insert_newline();
-                    return Ok(());
-                }
-                // Bare `/xxx`: exact command runs, highlight completes;
-                // bare picker commands open their picker.
-                match bare_enter(&app.input.buffer, app.picker_idx, app.picker_navigated) {
-                    Some(BareEnter::Complete(text)) => {
-                        app.input.buffer = text.clone();
-                        app.input.cursor_pos = app.input.buffer.len();
-                        reset_picker(app);
-                        if text == "/model " {
-                            // Preselect the active model (highlight only).
-                            let items = model_entries(app, "");
-                            if let Some(pos) = items
-                                .iter()
-                                .position(|(p, m, _)| p == &app.provider_name && m == &app.current_model)
-                            {
-                                app.picker_idx = pos;
-                            }
-                        }
-                        return Ok(());
-                    }
-                    Some(BareEnter::Submit) | None => {}
-                }
-                let input = std::mem::take(&mut app.input.buffer);
-                app.input.move_cursor_home();
-                app.input.history_index = None;
-                reset_picker(app);
-                if input.trim().is_empty() {
-                    return Ok(());
-                }
-                if app.event_rx.is_some() {
-                    // The agent is mid-run: keep the text. Sending it now would
-                    // interleave with the live turn, so it waits in the queue —
-                    // dropping it silently (what this used to do) lost work.
-                    queue_message(app, input);
-                    return Ok(());
-                }
-                submit_message(app, input)?;
+                return handle_enter(app, is_shift_enter(key));
             }
             KeyCode::Esc => {
                 if app.event_rx.is_some() {
@@ -1151,6 +1110,67 @@ fn queue_message(app: &mut App, text: String) {
     if app.notice.is_none() {
         app.notice = Some(format!("queued (#{} in line) — sends when the agent stops", n));
     }
+}
+
+/// The whole Enter path: Shift+Enter newline, bare-picker completion, then
+/// submit. The key handler and every test call *this*, so no test can bypass
+/// the completion step the way a hand-rolled copy of the arm did — that gap is
+/// exactly how "arrow key selects nvidia, Enter stores 9router" shipped.
+fn handle_enter(app: &mut App, shift_enter: bool) -> Result<()> {
+    if shift_enter {
+        app.input.insert_newline();
+        return Ok(());
+    }
+    // Bare `/xxx`: exact command runs, highlight completes; bare picker
+    // commands open their picker instead of running.
+    if let Some(BareEnter::Complete(text)) =
+        bare_enter(&app.input.buffer, app.picker_idx, app.picker_navigated)
+    {
+        app.input.buffer = text.clone();
+        app.input.move_cursor_end();
+        reset_picker(app);
+        if text == "/model " {
+            // Preselect the active model (highlight only).
+            let items = model_entries(app, "");
+            if let Some(pos) = items
+                .iter()
+                .position(|(p, m, _)| p == &app.provider_name && m == &app.current_model)
+            {
+                app.picker_idx = pos;
+            }
+        } else if text == "/login " {
+            // Preselect the first provider that still needs a key, so the
+            // highlight matches what Enter is going to do.
+            if let Some(pos) = provider_entries(app, "")
+                .iter()
+                .position(|(_, ready, _)| !ready)
+            {
+                app.picker_idx = pos;
+            }
+        }
+        return Ok(());
+    }
+    let input = std::mem::take(&mut app.input.buffer);
+    app.input.move_cursor_home();
+    app.input.history_index = None;
+    if input.trim().is_empty() {
+        reset_picker(app);
+        return Ok(());
+    }
+    if app.event_rx.is_some() {
+        // The agent is mid-run: keep the text. Sending it now would interleave
+        // with the live turn, so it waits in the queue — dropping it silently
+        // (what this used to do) lost work.
+        queue_message(app, input);
+        reset_picker(app);
+        return Ok(());
+    }
+    // Reset only *after* dispatch: `handle_slash` reads picker_idx and
+    // picker_navigated to know what the highlighted row means. Resetting first
+    // silently discarded every arrow-key selection.
+    let result = submit_message(app, input);
+    reset_picker(app);
+    result
 }
 
 /// Run one message: slash command, or a full agent turn. Used both by `Enter`
@@ -1289,34 +1309,20 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
             return Ok(true);
         }
         "/login" => {
-            if app.picker_navigated {
-                // Enter after arrow-key navigation: use highlighted picker entry.
+            if app.picker_navigated || arg.is_empty() {
+                // Enter always acts on the highlighted row. When the picker was
+                // only just opened, `picker_idx` was preselected to the first
+                // provider that still needs a key (see the Complete arm) — the
+                // old code searched for that provider *here* instead, so the
+                // highlight pointed at one row and Enter picked another.
                 let items = provider_entries(app, arg);
                 if items.is_empty() {
                     app.notice = Some("no matching providers".into());
                 } else if let Some(sel) = items.get(app.picker_idx % items.len()) {
-                    begin_login(app, &sel.0.clone());
+                    let pid = sel.0.clone();
+                    begin_login(app, &pid);
                 }
                 reset_picker(app);
-            } else if arg.is_empty() {
-                // Picker is open with nothing typed: confirm the highlighted
-                // entry — first provider still missing a key, else the first.
-                let items = provider_entries(app, "");
-                let pick = items
-                    .iter()
-                    .find(|(_, ready, _)| !ready)
-                    .or_else(|| items.first());
-                match pick {
-                    Some((pid, _, _)) => {
-                        let pid = pid.clone();
-                        app.pending_login = Some(pid.clone());
-                        app.login_buffer.clear();
-                        app.notice = Some(format!("paste API key for '{}' — Enter saves, Esc cancels", pid));
-                    }
-                    None => {
-                        app.notice = Some("no providers configured".into());
-                    }
-                }
             } else {
                 let word = arg.split_whitespace().next().unwrap_or("");
                 // Exact id first, else single fuzzy match (mirror /model).
@@ -1984,18 +1990,8 @@ mod tests {
     /// The Enter arm, minus the parts that need a real terminal: takes the
     /// buffer and routes it exactly like `handle_events` does.
     fn press_enter(app: &mut App) {
-        let input = std::mem::take(&mut app.input.buffer);
-        app.input.move_cursor_home();
-        app.input.history_index = None;
-        reset_picker(app);
-        if input.trim().is_empty() {
-            return;
-        }
-        if app.event_rx.is_some() {
-            super::queue_message(app, input);
-            return;
-        }
-        super::submit_message(app, input).unwrap();
+        // The real entry point — a copy of it is how the picker bug hid.
+        super::handle_enter(app, false).unwrap();
     }
 
     #[test]
@@ -2434,12 +2430,98 @@ mod tests {
         let entries = model_entries(&app, "");
         let (ep, em, _) = entries[2].clone();
         assert!(text.contains(&ep), "highlight shows 3rd entry, got: {}", text);
-        // Enter: replicate the Enter arm 1:1 (take buffer, submit to slash).
-        let input = std::mem::take(&mut app.input.buffer);
-        app.input.cursor_pos = 0;
-        super::handle_slash(&mut app, input.trim()).unwrap();
+        // Enter goes through the real entry point, not a copy of the key arm.
+        super::handle_enter(&mut app, false).unwrap();
         assert_eq!(app.provider_name, ep);
         assert_eq!(app.current_model, em);
+    }
+
+    /// Regression: `reset_picker` used to run *before* dispatch, so every
+    /// arrow-key selection was thrown away and Enter silently took the first
+    /// row. Picking `nvidia` in `/login` stored the key under `9router`.
+    #[test]
+    fn arrow_selection_survives_enter_in_every_picker() {
+        // /login: the provider the user highlighted must be the one that opens
+        // the key prompt.
+        let mut app = test_app();
+        app.input.buffer = "/login ".into();
+        app.input.set_cursor(app.input.buffer.len());
+        let entries = provider_entries(&app, "");
+        let target = entries
+            .iter()
+            .position(|(pid, _, _)| pid == "nvidia")
+            .expect("nvidia must be listed");
+        for _ in 0..target {
+            assert!(super::handle_picker_nav(&mut app, 1));
+        }
+        super::handle_enter(&mut app, false).unwrap();
+        assert_eq!(
+            app.pending_login.as_deref(),
+            Some("nvidia"),
+            "arrow-selected provider must win, not the first keyless one"
+        );
+
+        // /model: same shape, different picker.
+        let mut app = test_app();
+        app.input.buffer = "/model ".into();
+        app.input.set_cursor(app.input.buffer.len());
+        for _ in 0..3 {
+            assert!(super::handle_picker_nav(&mut app, 1));
+        }
+        let entries = model_entries(&app, "");
+        let (ep, em, _) = entries[3].clone();
+        super::handle_enter(&mut app, false).unwrap();
+        assert_eq!(app.provider_name, ep);
+        assert_eq!(app.current_model, em);
+
+        // /theme: a choice picker, to prove it is not login/model specific.
+        let mut app = test_app();
+        app.input.buffer = "/theme ".into();
+        app.input.set_cursor(app.input.buffer.len());
+        for _ in 0..2 {
+            assert!(super::handle_picker_nav(&mut app, 1));
+        }
+        let pick = choice_entries(&app, &ChoiceMode::Theme, "")[2].0.clone();
+        super::handle_enter(&mut app, false).unwrap();
+        assert_eq!(app.theme.name, pick);
+    }
+
+    /// Regression: pressing Up from the top must wrap to the *last* row, not
+    /// fall through to input history.
+    #[test]
+    fn arrow_up_wraps_to_last_provider() {
+        let mut app = test_app();
+        app.input.buffer = "/login ".into();
+        app.input.set_cursor(app.input.buffer.len());
+        assert!(super::handle_picker_nav(&mut app, -1));
+        let last = provider_entries(&app, "").len() - 1;
+        assert_eq!(app.picker_idx, last);
+        super::handle_enter(&mut app, false).unwrap();
+        let expected = provider_entries(&app, "")[last].0.clone();
+        assert_eq!(app.pending_login.as_deref(), Some(expected.as_str()));
+    }
+
+    /// Regression: `/model ` + Enter with no arrow press must land on the
+    /// *active* model, not the alphabetically first one — the preselect used to
+    /// be wiped by the same reset.
+    #[test]
+    fn model_picker_preselects_the_active_model() {
+        let mut app = test_app();
+        app.auth.set("nvidia", "nvapi-test-key");
+        super::handle_slash(&mut app, "/model nvidia").unwrap();
+        app.picker_idx = 0;
+        app.picker_navigated = false;
+        app.input.buffer = "/model ".into();
+        app.input.set_cursor(app.input.buffer.len());
+        // Same as pressing Enter on the freshly opened picker.
+        let pos = model_entries(&app, "")
+            .iter()
+            .position(|(p, m, _)| p == &app.provider_name && m == &app.current_model)
+            .expect("active model must be listed");
+        app.picker_idx = pos;
+        super::handle_enter(&mut app, false).unwrap();
+        assert_eq!(app.provider_name, "nvidia", "stays on the active provider");
+        assert_eq!(app.current_model, "openai/gpt-oss-20b");
     }
 
     #[test]
@@ -2600,9 +2682,68 @@ mod tests {
     #[test]
     fn login_empty_enter_picks_first_keyless_provider() {
         let mut app = test_app();
-        handle_slash(&mut app, "/login ").unwrap();
-        // ollama is always ready (dummy) so it must be skipped; 9router sorts first.
+        // Drive the real double-Enter flow: the first Enter opens the picker
+        // (and preselects), the second confirms. Calling handle_slash directly
+        // would skip the preselect and test a fiction.
+        app.input.buffer = "/login".into();
+        app.input.set_cursor(app.input.buffer.len());
+        // First Enter opens the picker; ollama is always ready (dummy) so the
+        // preselect must skip it and land on 9router.
+        super::handle_enter(&mut app, false).unwrap();
+        assert!(
+            app.pending_login.is_none(),
+            "first Enter only opens the picker"
+        );
+        assert_eq!(app.input.buffer, "/login ");
+        assert_eq!(
+            provider_entries(&app, "")[app.picker_idx].0,
+            "9router",
+            "preselect must be the first provider still missing a key"
+        );
+        // Second Enter confirms the highlighted row.
+        super::handle_enter(&mut app, false).unwrap();
         assert_eq!(app.pending_login.as_deref(), Some("9router"));
+    }
+
+    /// Regression: the highlight must never point at one row while Enter picks
+    /// another. Opening `/login` preselects the first provider needing a key,
+    /// so a plain Enter confirms exactly the row that is drawn.
+    #[test]
+    fn login_highlight_matches_what_enter_picks() {
+        let mut app = test_app();
+        app.input.buffer = "/login".into();
+        app.input.set_cursor(app.input.buffer.len());
+        // First Enter: open the picker through the real entry point.
+        super::handle_enter(&mut app, false).unwrap();
+        assert!(
+            app.pending_login.is_none(),
+            "first Enter must not open the prompt"
+        );
+
+        // What the screen highlights vs what the key prompt asks for.
+        let rows = draw_cells(&mut app, 100, 24);
+        let highlighted = highlighted_row_text(&rows, app.theme.accent);
+        super::handle_enter(&mut app, false).unwrap();
+        let asked = app.pending_login.clone().expect("prompt must open");
+        assert!(
+            highlighted.contains(&asked),
+            "highlight {:?} must be the provider the prompt asks for {:?}",
+            highlighted,
+            asked
+        );
+    }
+
+    /// Text of the picker row drawn with the accent background — what the user
+    /// actually sees as "selected".
+    fn highlighted_row_text(
+        rows: &[Vec<ratatui::buffer::Cell>],
+        accent: ratatui::style::Color,
+    ) -> String {
+        let hits = accent_rows(rows, accent);
+        match hits.first() {
+            Some(&y) => row_text(rows, y).trim().to_string(),
+            None => String::new(),
+        }
     }
 
     #[test]
@@ -2756,5 +2897,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
 
 
