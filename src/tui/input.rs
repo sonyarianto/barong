@@ -2480,6 +2480,61 @@ mod tests {
     }
 
     #[test]
+    fn empty_prompt_is_only_the_cursor() {
+        let mut app = test_app();
+        let rows = draw_cells(&mut app, 80, 24);
+        let prompt = prompt_box(&rows, 24);
+        assert_eq!(prompt.len(), 3, "{:?}", prompt);
+        // No affordance hints anywhere in the input area.
+        let whole = prompt.join(" ");
+        for hint in ["message", "commands", "@ files", "Esc cancel"] {
+            assert!(!whole.contains(hint), "prompt must not hint {:?}: {:?}", hint, whole);
+        }
+        // The cursor is there and it is the only thing on the row.
+        assert!(prompt[0].contains('\u{2588}'), "cursor: {:?}", prompt);
+        let text: String = prompt[0].trim_start_matches('\u{258c}').to_string();
+        assert_eq!(text.trim(), "\u{2588}", "just the cursor: {:?}", text);
+        // Nor on the welcome screen.
+        assert!(!chat_rows(&rows, 24).join(" ").contains("Type a message"));
+    }
+
+    #[test]
+    fn picker_columns_stay_inside_the_border() {
+        // The two-column layout was one cell too wide, so long descriptions
+        // pushed past the right border and drew over it.
+        for buffer in ["/", "/model ", "/login "] {
+            let mut app = test_app();
+            app.input.buffer = buffer.into();
+            app.input.set_cursor(app.input.buffer.len());
+            for w in [64u16, 80, 100] {
+                let rows = draw_cells(&mut app, w, 24);
+                let (top, bottom) = picker_span(&rows, 24).expect("picker opens");
+                // The right border column, taken from the top rule.
+                let rule: Vec<char> = row_text(&rows, top).chars().collect();
+                let edge = rule.iter().rposition(|c| *c == '╮').expect("top rule");
+                for y in (top + 1)..bottom {
+                    let line: Vec<char> = row_text(&rows, y).chars().collect();
+                    assert_eq!(
+                        line.get(edge),
+                        Some(&'│'),
+                        "row must close on the border at {} cols for {:?}: {:?}",
+                        w,
+                        buffer,
+                        line.iter().collect::<String>()
+                    );
+                    // Nothing painted outside the box.
+                    assert!(
+                        line[edge + 1..].iter().all(|c| c.is_whitespace()),
+                        "content spilled past the border at {} cols: {:?}",
+                        w,
+                        line.iter().collect::<String>()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn audit_every_picker_opens() {
         // "/resume " has no rows without saved sessions — correct, nothing to pick.
         for buffer in ["/", "/model ", "/login ", "/theme ", "/approve "] {

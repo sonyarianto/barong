@@ -126,10 +126,6 @@ fn render_chat(frame: &mut Frame, area: Rect, app: &mut App) {
             )),
             Line::from(Span::raw("")),
             Line::from(Span::styled(
-                "  Type a message to start  •  / commands  •  @ files  •  Esc cancel",
-                Style::default().fg(t.muted),
-            )),
-            Line::from(Span::styled(
                 format!(
                     "  {}  •  {}  •  {} tools  •  {} theme",
                     app.cwd_short(),
@@ -276,7 +272,6 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
 const MAX_PROMPT_ROWS: u16 = 8;
 /// `┃` + one space of inset on each side.
 const PROMPT_INSET: u16 = 3;
-const PROMPT_PLACEHOLDER: &str = "message · / commands · @ files";
 
 /// The row inside the box that names the endpoint, mirroring OpenCode's
 /// `agent · model · variant` line.
@@ -397,14 +392,13 @@ fn prompt_box_rows(app: &App, area_width: u16) -> u16 {
     draft.saturating_add(2).clamp(3, MAX_PROMPT_ROWS)
 }
 
-/// What the prompt line shows when there is nothing typed.
+/// What the prompt line shows. An empty prompt is nothing but the block
+/// cursor: the affordances (`/`, `@`) live in `/help` and `/hotkeys`, and a
+/// hint sitting in the input was the loudest thing on an idle screen.
 fn prompt_draft_text(app: &App) -> String {
     if let Some(pid) = &app.pending_login {
         let masked = "•".repeat(app.login_buffer.chars().count().min(48));
         return format!("key for {}: {}", pid, masked);
-    }
-    if app.input.buffer.is_empty() && !app.input.buffer.starts_with('/') {
-        return PROMPT_PLACEHOLDER.to_string();
     }
     let cursor = app.input.cursor();
     let mut display = app.input.buffer.clone();
@@ -449,12 +443,12 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
         .saturating_sub(height.saturating_sub(3))
         .min((rows.len() as u16).saturating_sub(1));
 
-    let is_placeholder = app.input.buffer.is_empty() && app.pending_login.is_none();
-    let draft_style = Style::default().bg(t.panel).fg(if is_placeholder {
-        t.muted
+    // An empty prompt is just the cursor, so paint it like one.
+    let draft_style = if app.input.buffer.is_empty() && app.pending_login.is_none() {
+        Style::default().bg(t.panel).fg(t.accent)
     } else {
-        Color::Reset
-    });
+        Style::default().bg(t.panel).fg(Color::Reset)
+    };
     let bar = Style::default().fg(t.accent).bg(t.panel);
 
     for row in 0..height {
@@ -603,8 +597,9 @@ fn render_picker(
                     format!(" {}", truncate(&row.left, 12)),
                     label_style,
                 ));
+                // " " + left(12) + " " + right must land on `avail`.
                 spans.push(Span::styled(
-                    format!(" {}", truncate(&row.right, avail - 13)),
+                    format!(" {}", truncate(&row.right, avail - 14)),
                     detail_style,
                 ));
             } else {
@@ -616,7 +611,7 @@ fn render_picker(
                     format!("{} {}", row.left, row.right)
                 };
                 spans.push(Span::styled(
-                    format!(" {}", truncate(&merged, avail.max(1))),
+                    format!(" {}", truncate(&merged, avail.saturating_sub(1).max(1))),
                     label_style,
                 ));
             }
