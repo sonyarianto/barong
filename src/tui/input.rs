@@ -1543,8 +1543,18 @@ mod tests {
     }
 
     #[test]
-    fn discovered_models_merge_first_without_dupes() {
-        let _guard = HOME_LOCK.lock().unwrap();
+    fn keyless_public_catalogs_are_discoverable() {
+        let app = test_app();
+        // No keys saved anywhere: openrouter/ollama/9router serve /v1/models
+        // publicly, gated ones (deepseek, nvidia) stay skipped.
+        assert!(app.discovery_target("9router").is_some());
+        assert!(app.discovery_target("openrouter").is_some());
+        assert!(app.discovery_target("deepseek").is_none());
+        assert!(app.discovery_target("anthropic").is_none());
+    }
+
+    #[test]
+    fn discovered_models_merge_first_without_dupes() {        let _guard = HOME_LOCK.lock().unwrap();
         let app = test_app_locked();
         // Inject discovery results via temp-HOME cache file path (isolated).
         let tmp = std::env::temp_dir().join(format!("barong-model-repro-{}", std::process::id()));

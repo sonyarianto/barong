@@ -269,15 +269,17 @@ impl App {
         resolve_api_key(&self.provider_name, &self.auth, &self.config).0
     }
 
-    fn discovery_target(&self, provider_id: &str) -> Option<(String, String)> {
+    pub fn discovery_target(&self, provider_id: &str) -> Option<(String, String)> {
         let id = provider_id.trim().to_lowercase();
         let rpc = self.config.resolve_provider_config(&id);
         if rpc.api != "openai" || rpc.base_url.is_empty() {
             return None; // anthropic has no list endpoint; unknown has no URL
         }
         let (key, _) = resolve_api_key(&id, &self.auth, &self.config);
-        if key.is_empty() && id != "openrouter" && id != "ollama" {
-            return None; // gated endpoints need a key (openrouter is public)
+        // Most catalogs are key-gated, but these serve /v1/models publicly.
+        let public_catalog = matches!(id.as_str(), "openrouter" | "ollama" | "9router");
+        if key.is_empty() && !public_catalog {
+            return None;
         }
         Some((rpc.base_url.clone(), key))
     }
