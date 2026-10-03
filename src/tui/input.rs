@@ -1,4 +1,4 @@
-use crate::app::App;
+use crate::app::{App, NoticeCause};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use std::sync::atomic::Ordering;
@@ -261,7 +261,7 @@ fn handle_permission_key(app: &mut App, code: crossterm::event::KeyCode) -> Resu
             app.approve_pending(Decision::Deny);
         }
         _ => {
-            app.notice = Some("y=allow once · a=always · n=deny".into());
+            app.notify("y=allow once · a=always · n=deny");
         }
     }
     return Ok(());
@@ -481,7 +481,7 @@ pub fn model_entries(app: &App, filter: &str) -> Vec<(String, String, bool)> {
 fn begin_login(app: &mut App, pid: &str) {
     app.pending_login = Some(pid.to_string());
     app.login_buffer.clear();
-    app.notice = Some(format!("paste API key for '{}' — Enter saves, Esc cancels", pid));
+    app.notify(format!("paste API key for '{}' — Enter saves, Esc cancels", pid));
 }
 
 fn handle_login_key(app: &mut App, key: crossterm::event::KeyEvent) -> Result<()> {    use crossterm::event::{KeyCode, KeyModifiers};
@@ -489,7 +489,7 @@ fn handle_login_key(app: &mut App, key: crossterm::event::KeyEvent) -> Result<()
     if key.code == KeyCode::Esc {
         app.pending_login = None;
         app.login_buffer.clear();
-        app.notice = Some("login cancelled".into());
+        app.notify("login cancelled");
         return Ok(());
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -522,7 +522,7 @@ fn handle_login_key(app: &mut App, key: crossterm::event::KeyEvent) -> Result<()
             if let Some(pid) = app.pending_login.take() {
                 let entered = std::mem::take(&mut app.login_buffer);
                 if entered.trim().is_empty() {
-                    app.notice = Some("empty key — login cancelled".into());
+                    app.notify("empty key — login cancelled");
                 } else {
                     app.auth.set(&pid, entered.trim());
                     // The point of /login is to USE the provider: switch to it
@@ -532,14 +532,14 @@ fn handle_login_key(app: &mut App, key: crossterm::event::KeyEvent) -> Result<()
                     app.refresh_provider(&pid);
                     match app.apply_provider_model(&pid, &def) {
                         Ok(_) => {
-                            app.notice = Some(format!("saved key + switched to '{}/{}'", pid, def));
+                            app.notify(format!("saved key + switched to '{}/{}'", pid, def));
                             app.conversation.add_message(
                                 "assistant".into(),
                                 format!("API key saved for `{}`. Switched to `{}` — ready to chat.", pid, model_label(&pid, &def)),
                             );
                         }
                         Err(e) => {
-                            app.notice = Some(format!("saved key for '{}'", pid));
+                            app.notify(format!("saved key for '{}'", pid));
                             app.conversation.add_message("assistant".into(), e);
                         }
                     }
@@ -770,7 +770,7 @@ fn complete_mention(app: &mut App) {
     }
     let matches = find_files(&app.workspace.root, partial, 20);
     if matches.is_empty() {
-        app.notice = Some("no file match".into());
+        app.notify("no file match");
         return;
     }
     if matches.len() == 1 {
@@ -790,7 +790,7 @@ fn complete_mention(app: &mut App) {
         let extra = common[partial.len()..].to_string();
         app.input.insert_str(&extra);
     }
-    app.notice = Some(format!("{} matches: {}", matches.len(), matches.iter().take(3).cloned().collect::<Vec<_>>().join(", ")));
+    app.notify(format!("{} matches: {}", matches.len(), matches.iter().take(3).cloned().collect::<Vec<_>>().join(", ")));
 }
 
 fn find_files(root: &std::path::Path, partial: &str, cap: usize) -> Vec<String> {
@@ -947,7 +947,7 @@ pub fn handle_events(app: &mut App) -> Result<()> {
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
-        app.notice = None;
+        app.clear_ephemeral_notice();
 
         // --- Ctrl combos first ---
         if ctrl {
@@ -993,13 +993,13 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                 }
                 KeyCode::Char('o') | KeyCode::Char('O') => {
                     app.tool_expanded = !app.tool_expanded;
-                    app.notice = Some(if app.tool_expanded { "tool output expanded" } else { "tool output collapsed" }.into());
+                    app.notify(if app.tool_expanded { "tool output expanded" } else { "tool output collapsed" });
                     return Ok(());
                 }
                 KeyCode::Char('t') | KeyCode::Char('T') => {
                     app.workspace = crate::workspace::WorkspaceContext::new();
                     app.tree_visible = !app.tree_visible;
-                    app.notice = Some(if app.tree_visible { "tree panel on" } else { "tree panel off" }.into());
+                    app.notify(if app.tree_visible { "tree panel on" } else { "tree panel off" });
                     return Ok(());
                 }
                 _ => {}
@@ -1076,7 +1076,7 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                     if !app.queued_input.is_empty() {
                         let n = app.queued_input.len();
                         app.queued_input.clear();
-                        app.notice = Some(format!("cancelled · {} queued dropped", n));
+                        app.notify(format!("cancelled · {} queued dropped", n));
                     }
                 } else if app.input.buffer.starts_with('/') {
                     app.input.buffer.clear();
@@ -1108,12 +1108,15 @@ const MAX_QUEUED: usize = 8;
 fn queue_message(app: &mut App, text: String) {
     if app.queued_input.len() >= MAX_QUEUED {
         app.queued_input.remove(0);
-        app.notice = Some(format!("queue full ({}) — oldest dropped", MAX_QUEUED));
+        app.notify_blocking_cause(
+            format!("queue full ({}) — a queued message was dropped", MAX_QUEUED),
+            NoticeCause::QueueDropped,
+        );
     }
     let n = app.queued_input.len() + 1;
     app.queued_input.push(text);
     if app.notice.is_none() {
-        app.notice = Some(format!("queued (#{} in line) — sends when the agent stops", n));
+        app.notify(format!("queued (#{} in line) — sends when the agent stops", n));
     }
 }
 
@@ -1187,8 +1190,19 @@ pub fn submit_message(app: &mut App, input: String) -> Result<()> {
     // @file expansion (context attach)
     let (expanded, missing) = expand_mentions(&input, &app.workspace.root);
     if !missing.is_empty() {
-        app.notice = Some(format!("@ not found: {}", missing.join(", ")));
+        app.notify_blocking_cause(
+            format!("@ not found: {}", missing.join(", ")),
+            NoticeCause::MissingMention,
+        );
+    } else {
+        // The bad mention is gone from the draft, so its notice has served
+        // its purpose — but only that one, never an unrelated "no API key".
+        app.resolve_notice(NoticeCause::MissingMention);
     }
+    // The turn is actually starting, so the queue is accepting messages again
+    // and a previous send failure no longer describes the present.
+    app.resolve_notice(NoticeCause::QueueDropped);
+    app.resolve_notice(NoticeCause::SendFailed);
     app.input.push_history(input.clone());
     app.conversation.add_message("user".into(), input);
     // stash expanded for the agent without polluting transcript:
@@ -1322,8 +1336,14 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
                 // highlight pointed at one row and Enter picked another.
                 let items = provider_entries(app, arg);
                 if items.is_empty() {
-                    app.notice = Some("no matching providers".into());
+                    app.notify_blocking_cause(
+                        "no matching providers",
+                        NoticeCause::NoProviderMatch,
+                    );
                 } else if let Some(sel) = items.get(app.picker_idx % items.len()) {
+                    // A provider is in hand, so "no matching providers" is
+                    // history.
+                    app.resolve_notice(NoticeCause::NoProviderMatch);
                     let pid = sel.0.clone();
                     begin_login(app, &pid);
                 }
@@ -1507,9 +1527,9 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
         "/copy" => {
             let last = app.conversation.messages.iter().rev().find(|m| m.role == "assistant").and_then(|m| m.content.clone()).unwrap_or_default();
             if last.is_empty() {
-                app.notice = Some("nothing to copy".into());
+                app.notify("nothing to copy");
             } else if copy_to_clipboard(&last) {
-                app.notice = Some("copied last response".into());
+                app.notify("copied last response");
             } else {
                 app.conversation.add_message("assistant".into(), format!("```\n{}\n```", last.chars().take(2000).collect::<String>()));
             }
@@ -1551,7 +1571,7 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
             // (and the provider's count for the previous one) are both stale.
             app.last_prompt_tokens = None;
             app.refresh_prompt_overhead_for_reload();
-            app.notice = Some("workspace reloaded".into());
+            app.notify("workspace reloaded");
             app.is_home = false;
             return Ok(true);
         }
@@ -1576,7 +1596,7 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
         "/tree" => {
             app.workspace = crate::workspace::WorkspaceContext::new();
             app.tree_visible = !app.tree_visible;
-            app.notice = Some(if app.tree_visible { "tree panel on" } else { "tree panel off" }.into());
+            app.notify(if app.tree_visible { "tree panel on" } else { "tree panel off" });
             app.is_home = false;
             return Ok(true);
         }
@@ -1805,76 +1825,6 @@ mod tests {
         assert!(!is_shift_enter(ctrl_j));
     }
 
-    #[test]
-    fn prompt_box_has_accent_bar_endpoint_row_and_one_status_line() {
-        let mut app = test_app();
-        app.input.buffer = "read @src/main.rs".into();
-        app.input.set_cursor(app.input.buffer.len());
-        let rows = draw_cells(&mut app, 80, 24);
-        let prompt = prompt_box(&rows, 24);
-        // pad + draft + breathing + endpoint + pad
-        assert_eq!(prompt.len(), 5, "{:?}", prompt);
-        assert_box_shape(&prompt, "idle prompt");
-        assert!(
-            prompt[1].contains("read @src/main.rs"),
-            "draft: {:?}",
-            prompt
-        );
-        // The endpoint row lives inside the box, like OpenCode's agent/model line.
-        let endpoint = endpoint_row(&rows, 24);
-        assert!(
-            endpoint.contains(&app.provider_name),
-            "provider: {:?}",
-            endpoint
-        );
-        assert!(
-            endpoint.contains(&app.current_model),
-            "model: {:?}",
-            endpoint
-        );
-        assert!(
-            endpoint.contains(if app.permission_gate.auto_approve() { "auto" } else { "ask" }),
-            "mode: {:?}",
-            endpoint
-        );
-        // The status line follows the box directly, with no rule in between.
-        let status = status_line(&rows, 24);
-        assert!(status.contains("msgs"), "status: {:?}", status);
-        assert!(status.contains('(') && status.contains('%'), "gauge: {:?}", status);
-        assert!(!status.contains("dark"), "theme name is not daily-use info: {:?}", status);
-        // Every row of the box carries the panel background — including the
-        // endpoint row, which used to sit on the terminal default and showed
-        // as a pale band across the box.
-        for line in rows.iter().rev().skip(1).take(5) {
-            for cell in line.iter().take(70) {
-                assert_eq!(
-                    cell.bg,
-                    app.theme.panel,
-                    "box row must be panel-coloured, got {:?}",
-                    cell.bg
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn notice_lands_above_the_prompt_not_in_the_status_row() {
-        let mut app = test_app();
-        app.notice = Some("no API key for 'openai' — /login openai or set env".into());
-        let rows = draw_cells(&mut app, 80, 24);
-        let notice = notice_line(&rows, 24).expect("notice row");
-        assert!(notice.contains("no API key"), "notice: {:?}", notice);
-        assert!(
-            !status_line(&rows, 24).contains("no API key"),
-            "status must stay short: {:?}",
-            status_line(&rows, 24)
-        );
-        // And it disappears when there is nothing to say.
-        app.notice = None;
-        let rows = draw_cells(&mut app, 80, 24);
-        assert!(notice_line(&rows, 24).is_none(), "no empty notice row");
-    }
-
     /// Full interactive audit through a headless terminal: picker opens for
     /// every mode, highlight moves with navigation, Enter applies it.
     /// This is the closest we get to clicking through the TUI in CI.
@@ -1886,6 +1836,13 @@ mod tests {
         (0..h)
             .map(|y| (0..w).map(|x| buf[(x, y)].clone()).collect::<Vec<_>>())
             .collect()
+    }
+
+    /// Top and bottom border rows of the rounded picker box.
+    fn picker_span(rows: &[Vec<ratatui::buffer::Cell>], h: u16) -> Option<(usize, usize)> {
+        let top = (0..h as usize).find(|&y| row_text(rows, y).contains('╭'))?;
+        let bottom = (0..h as usize).find(|&y| row_text(rows, y).contains('╰'))?;
+        Some((top, bottom))
     }
 
     /// Text rows (y) containing a highlighted (accent-bg) cell.
@@ -1980,6 +1937,199 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn prompt_box_has_accent_bar_endpoint_row_and_one_status_line() {
+        let mut app = test_app();
+        app.input.buffer = "read @src/main.rs".into();
+        app.input.set_cursor(app.input.buffer.len());
+        let rows = draw_cells(&mut app, 80, 24);
+        let prompt = prompt_box(&rows, 24);
+        // pad + draft + breathing + endpoint + pad
+        assert_eq!(prompt.len(), 5, "{:?}", prompt);
+        assert_box_shape(&prompt, "idle prompt");
+        assert!(
+            prompt[1].contains("read @src/main.rs"),
+            "draft: {:?}",
+            prompt
+        );
+        // The endpoint row lives inside the box, like OpenCode's agent/model line.
+        let endpoint = endpoint_row(&rows, 24);
+        assert!(
+            endpoint.contains(&app.provider_name),
+            "provider: {:?}",
+            endpoint
+        );
+        assert!(
+            endpoint.contains(&app.current_model),
+            "model: {:?}",
+            endpoint
+        );
+        assert!(
+            endpoint.contains(if app.permission_gate.auto_approve() { "auto" } else { "ask" }),
+            "mode: {:?}",
+            endpoint
+        );
+        // The status line follows the box directly, with no rule in between.
+        let status = status_line(&rows, 24);
+        assert!(status.contains("msgs"), "status: {:?}", status);
+        assert!(status.contains('(') && status.contains('%'), "gauge: {:?}", status);
+        assert!(!status.contains("dark"), "theme name is not daily-use info: {:?}", status);
+        // Every row of the box carries the panel background — including the
+        // endpoint row, which used to sit on the terminal default and showed
+        // as a pale band across the box.
+        for line in rows.iter().rev().skip(1).take(5) {
+            for cell in line.iter().take(70) {
+                assert_eq!(
+                    cell.bg,
+                    app.theme.panel,
+                    "box row must be panel-coloured, got {:?}",
+                    cell.bg
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn notice_lands_above_the_prompt_not_in_the_status_row() {
+        let mut app = test_app();
+        app.notify_blocking("no API key for 'openai' — /login openai or set env");
+        let rows = draw_cells(&mut app, 80, 24);
+        let notice = notice_line(&rows, 24).expect("notice row");
+        assert!(notice.contains("no API key"), "notice: {:?}", notice);
+        // Blocking messages get the warning colour and a `!` marker.
+        assert!(notice.trim_start().starts_with('!'), "marker: {:?}", notice);
+        let y = (0..24usize).find(|y| row_text(&rows, *y).contains("no API key")).unwrap();
+        assert_eq!(rows[y][0].fg, app.theme.warning, "blocking colour");
+        // The status line stays short regardless.
+        assert!(
+            !status_line(&rows, 24).contains("no API key"),
+            "status must stay short: {:?}",
+            status_line(&rows, 24)
+        );
+    }
+
+    #[test]
+    fn blocking_notice_survives_keystrokes_but_info_does_not() {
+        let mut app = test_app();
+
+        app.notify("theme: barong");
+        assert!(app.notice.is_some());
+        app.clear_ephemeral_notice();
+        assert!(app.notice.is_none(), "info is cleared by the next keystroke");
+
+        app.notify_blocking("no API key for 'openai'");
+        app.clear_ephemeral_notice();
+        assert!(
+            app.notice.is_some(),
+            "a message the user must act on must not vanish on the first keypress"
+        );
+        // Explicit acknowledgement still clears it.
+        app.clear_notice();
+        assert!(app.notice.is_none());
+    }
+
+    #[test]
+    fn resolving_one_condition_leaves_unrelated_blocking_notices_alone() {
+        let mut app = test_app();
+
+        app.notify_blocking_cause("no API key for 'openai'", NoticeCause::MissingKey);
+        app.resolve_notice(NoticeCause::MissingMention);
+        assert!(
+            app.notice.is_some(),
+            "a resolved @mention must not silently clear an unrelated missing key"
+        );
+
+        app.resolve_notice(NoticeCause::MissingKey);
+        assert!(app.notice.is_none(), "resolving its own cause clears it");
+    }
+
+    #[test]
+    fn a_bad_mention_is_retired_once_the_draft_is_clean() {
+        let mut app = test_app();
+
+        submit_message(&mut app, "@tidak-ada.txt hello".into()).unwrap();
+        let notice = app.notice.clone().expect("blocking notice");
+        assert!(notice.is_blocking());
+        assert!(notice.text.contains("@ not found"), "text: {:?}", notice.text);
+        assert_eq!(notice.cause, NoticeCause::MissingMention);
+        // Typing must not take it away...
+        app.clear_ephemeral_notice();
+        assert!(app.notice.is_some(), "still blocking");
+
+        // ...but a draft whose mentions all resolve retires it.
+        submit_message(&mut app, "hello".into()).unwrap();
+        assert!(
+            app.notice.is_none(),
+            "the bad mention is gone, so its notice should be too"
+        );
+    }
+
+    #[test]
+    fn a_successful_send_retires_a_previous_send_failure() {
+        let mut app = test_app();
+        app.notify_blocking_cause("queued message failed: boom", NoticeCause::SendFailed);
+        submit_message(&mut app, "hello".into()).unwrap();
+        assert!(app.notice.is_none(), "the new turn supersedes the old failure");
+    }
+
+    #[test]
+    fn info_notice_is_muted_and_blocking_is_not() {
+        let mut app = test_app();
+        app.notify("copied last response");
+        let rows = draw_cells(&mut app, 80, 24);
+        let y = (0..24usize)
+            .find(|y| row_text(&rows, *y).contains("copied last response"))
+            .expect("info notice row");
+        assert_eq!(rows[y][0].fg, app.theme.muted, "info is muted");
+        assert!(row_text(&rows, y).trim_start().starts_with('\u{258e}'), "marker");
+    }
+
+    #[test]
+    fn no_notice_means_no_row() {
+        let mut app = test_app();
+        app.notify("temporary");
+        let _ = draw_cells(&mut app, 80, 24);
+        app.clear_notice();
+        let rows = draw_cells(&mut app, 80, 24);
+        assert!(notice_line(&rows, 24).is_none(), "no empty notice row");
+    }
+
+    #[test]
+    fn picker_columns_stay_inside_the_border() {
+        // The two-column layout was one cell too wide, so long descriptions
+        // pushed past the right border and drew over it.
+        for buffer in ["/", "/model ", "/login "] {
+            let mut app = test_app();
+            app.input.buffer = buffer.into();
+            app.input.set_cursor(app.input.buffer.len());
+            for w in [64u16, 80, 100] {
+                let rows = draw_cells(&mut app, w, 24);
+                let (top, bottom) = picker_span(&rows, 24).expect("picker opens");
+                // The right border column, taken from the top rule.
+                let rule: Vec<char> = row_text(&rows, top).chars().collect();
+                let edge = rule.iter().rposition(|c| *c == '╮').expect("top rule");
+                for y in (top + 1)..bottom {
+                    let line: Vec<char> = row_text(&rows, y).chars().collect();
+                    assert_eq!(
+                        line.get(edge),
+                        Some(&'│'),
+                        "row must close on the border at {} cols for {:?}: {:?}",
+                        w,
+                        buffer,
+                        line.iter().collect::<String>()
+                    );
+                    // Nothing painted outside the box.
+                    assert!(
+                        line[edge + 1..].iter().all(|c| c.is_whitespace()),
+                        "content spilled past the border at {} cols: {:?}",
+                        w,
+                        line.iter().collect::<String>()
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -2404,15 +2554,6 @@ mod tests {
         assert!(joined.contains("review the diff carefully"), "value shown:\n{}", joined);
     }
 
-    // --- picker geometry: it must fit above the input and stay readable ---
-
-    /// Rows occupied by the picker's border box (0 = not open).
-    fn picker_span(rows: &[Vec<ratatui::buffer::Cell>], h: u16) -> Option<(usize, usize)> {
-        let top = (0..h as usize).find(|&y| row_text(rows, y).contains('╭'))?;
-        let bottom = (0..h as usize).find(|&y| row_text(rows, y).contains('╰'))?;
-        Some((top, bottom))
-    }
-
     #[test]
     fn picker_never_covers_the_input() {
         // Small terminals used to get a 10-row picker pasted over the input box.
@@ -2534,42 +2675,6 @@ mod tests {
         assert_eq!(text.trim(), "\u{2588}", "just the cursor: {:?}", text);
         // Nor on the welcome screen.
         assert!(!chat_rows(&rows, 24).join(" ").contains("Type a message"));
-    }
-
-    #[test]
-    fn picker_columns_stay_inside_the_border() {
-        // The two-column layout was one cell too wide, so long descriptions
-        // pushed past the right border and drew over it.
-        for buffer in ["/", "/model ", "/login "] {
-            let mut app = test_app();
-            app.input.buffer = buffer.into();
-            app.input.set_cursor(app.input.buffer.len());
-            for w in [64u16, 80, 100] {
-                let rows = draw_cells(&mut app, w, 24);
-                let (top, bottom) = picker_span(&rows, 24).expect("picker opens");
-                // The right border column, taken from the top rule.
-                let rule: Vec<char> = row_text(&rows, top).chars().collect();
-                let edge = rule.iter().rposition(|c| *c == '╮').expect("top rule");
-                for y in (top + 1)..bottom {
-                    let line: Vec<char> = row_text(&rows, y).chars().collect();
-                    assert_eq!(
-                        line.get(edge),
-                        Some(&'│'),
-                        "row must close on the border at {} cols for {:?}: {:?}",
-                        w,
-                        buffer,
-                        line.iter().collect::<String>()
-                    );
-                    // Nothing painted outside the box.
-                    assert!(
-                        line[edge + 1..].iter().all(|c| c.is_whitespace()),
-                        "content spilled past the border at {} cols: {:?}",
-                        w,
-                        line.iter().collect::<String>()
-                    );
-                }
-            }
-        }
     }
 
     #[test]
@@ -3075,8 +3180,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
-
-
-
-
 

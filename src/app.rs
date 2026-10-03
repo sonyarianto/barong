@@ -18,6 +18,50 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+/// Severity of the status line above the prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeLevel {
+    /// Confirmation or guidance: gone on the next keystroke.
+    Info,
+    /// The user asked for something that did not happen. Stays until they act.
+    Blocking,
+}
+
+/// What a blocking message is about, so it can be cleared the moment the
+/// condition it describes is actually gone — and only then. Without this the
+/// alternative is one blunt `clear_notice()` that wipes an unrelated "no API
+/// key" the moment you send a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeCause {
+    /// No cause recorded; only an explicit `clear_notice()` clears it.
+    Generic,
+    /// A provider has no API key yet.
+    MissingKey,
+    /// A provider/model switch was rejected.
+    ProviderSwitch,
+    /// An `@file` in the draft does not exist.
+    MissingMention,
+    /// `/login <word>` matched no provider.
+    NoProviderMatch,
+    /// The send queue was full, so a message was dropped.
+    QueueDropped,
+    /// A previous send failed.
+    SendFailed,
+}
+
+#[derive(Debug, Clone)]
+pub struct Notice {
+    pub text: String,
+    pub level: NoticeLevel,
+    pub cause: NoticeCause,
+}
+
+impl Notice {
+    pub fn is_blocking(&self) -> bool {
+        self.level == NoticeLevel::Blocking
+    }
+}
+
 pub struct App {
     pub conversation: Conversation,
     pub input: InputState,
@@ -50,7 +94,7 @@ pub struct App {
     pub picker_idx: usize,
     pub picker_navigated: bool,
     pub tool_expanded: bool,
-    pub notice: Option<String>,
+    pub notice: Option<Notice>,
     pub spinner_tick: usize,
     pub permission_gate: PermissionGate,
     pub pending_approval: Option<PendingTool>,
@@ -175,10 +219,21 @@ impl App {
             picker_navigated: false,
             tool_expanded: false,
             notice: if initial_key.is_empty() {
-                Some(format!("no API key for '{}' — /login {} or set env", provider_name, provider_name))
+                Some(Notice {
+                    text: format!(
+                        "no API key for '{}' — /login {} or set env",
+                        provider_name, provider_name
+                    ),
+                    level: NoticeLevel::Blocking,
+                    cause: NoticeCause::MissingKey,
+                })
             } else if let Some(id) = restored_id {
                 let short: String = id.chars().take(12).collect();
-                Some(format!("resumed session {} — /new for fresh", short))
+                Some(Notice {
+                    text: format!("resumed session {} — /new for fresh", short),
+                    level: NoticeLevel::Info,
+                    cause: NoticeCause::Generic,
+                })
             } else {
                 None
             },
@@ -224,7 +279,15 @@ impl App {
             ep.base_url = self.base_url.clone();
         }
         if key.is_empty() {
-            self.notice = Some(format!("no API key for '{}' — /login {}", id, id));
+            self.notify_blocking_cause(
+                format!("no API key for '{}' — /login {}", id, id),
+                NoticeCause::MissingKey,
+            );
+        } else {
+            // Getting here means the switch landed *and* there is a key, so any
+            // complaint about the previous provider or the missing key is over.
+            self.resolve_notice(NoticeCause::ProviderSwitch);
+            self.resolve_notice(NoticeCause::MissingKey);
         }
         Ok(())
     }
@@ -253,17 +316,20 @@ impl App {
         if let Some(p) = provider.map(str::trim).filter(|s| !s.is_empty()) {
             let def = self.config.resolve_default_model(p);
             if let Err(e) = self.apply_provider_model(p, &def) {
-                self.notice = Some(e);
+                self.notify_blocking(e);
             }
         }
         if let Some(m) = model.map(str::trim).filter(|s| !s.is_empty()) {
             match self.parse_model_arg(m) {
                 Some((p, mm)) => {
                     if let Err(e) = self.apply_provider_model(&p, &mm) {
-                        self.notice = Some(e);
+                        self.notify_blocking_cause(e, NoticeCause::ProviderSwitch);
                     }
                 }
-                None => self.notice = Some(format!("bad --model '{}', use provider/model", m)),
+                None => self.notify_blocking_cause(
+                    format!("bad --model '{}', use provider/model", m),
+                    NoticeCause::ProviderSwitch,
+                ),
             }
         }
     }
@@ -314,20 +380,66 @@ impl App {
         }
     }
 
+    /// Ephemeral message: cleared by the next keystroke.
+    pub fn notify(&mut self, text: impl Into<String>) {
+        self.notice = Some(Notice {
+            text: text.into(),
+            level: NoticeLevel::Info,
+            cause: NoticeCause::Generic,
+        });
+    }
+
+    /// Message the user has to act on. Keystrokes do not clear it — that is
+    /// the whole point: "no API key" used to vanish on the first keypress.
+    pub fn notify_blocking(&mut self, text: impl Into<String>) {
+        self.notify_blocking_cause(text, NoticeCause::Generic);
+    }
+
+    /// Blocking message tagged with the condition it reports, so the code that
+    /// fixes that condition can retire the notice precisely.
+    pub fn notify_blocking_cause(&mut self, text: impl Into<String>, cause: NoticeCause) {
+        self.notice = Some(Notice {
+            text: text.into(),
+            level: NoticeLevel::Blocking,
+            cause,
+        });
+    }
+
+    /// Drop an ephemeral message, leaving blocking ones alone.
+    pub fn clear_ephemeral_notice(&mut self) {
+        if self.notice.as_ref().is_some_and(|n| !n.is_blocking()) {
+            self.notice = None;
+        }
+    }
+
+    /// Drop any message. Called when the user acts on a blocking one.
+    pub fn clear_notice(&mut self) {
+        self.notice = None;
+    }
+
+    /// Retire a blocking notice because the condition it reported is resolved.
+    /// Info notices and notices about other conditions are left alone.
+    pub fn resolve_notice(&mut self, cause: NoticeCause) {
+        if self.notice.as_ref().is_some_and(|n| n.cause == cause) {
+            self.notice = None;
+        }
+    }
+
     pub fn set_theme(&mut self, name: &str) {
         self.theme = theme::resolve(name);
         self.config.theme = Some(self.theme.name.clone());
-        self.notice = Some(format!("theme: {}", self.theme.name));
+        self.notify(format!("theme: {}", self.theme.name));
     }
 
     pub fn approve_pending(&mut self, decision: Decision) {
         if let Some(p) = self.pending_approval.take() {
             self.permission_gate.resolve(&p.id, decision.clone());
-            self.notice = Some(match decision {
+            let text = match decision {
                 Decision::AllowOnce => format!("allowed {} once", p.name),
                 Decision::AllowSession => format!("always allow {} this session", p.name),
                 Decision::Deny => format!("denied {}", p.name),
-            });
+            };
+            self.notify(text);
         }
     }
 
@@ -482,7 +594,11 @@ impl App {
                     }
                     Ok(StreamEvent::PermissionResult { id: _, approved }) => {
                         if !approved {
-                            self.notice = Some("tool denied".into());
+                            self.notice = Some(Notice {
+                                text: "tool denied".into(),
+                                level: NoticeLevel::Info,
+                                cause: NoticeCause::Generic,
+                            });
                         }
                         self.status.tool_status = "processing...".into();
                     }
@@ -544,7 +660,10 @@ impl App {
         // A failure here (e.g. missing key) leaves event_rx None, so the next
         // frame drains the rest — no spin, the queue always shrinks.
         if let Err(e) = crate::tui::input::submit_message(self, next) {
-            self.notice = Some(format!("queued message failed: {}", e));
+            self.notify_blocking_cause(
+                format!("queued message failed: {}", e),
+                NoticeCause::SendFailed,
+            );
         }
     }
 
@@ -605,7 +724,7 @@ impl App {
 
     pub fn start_agent(&mut self) {
         if let Some(report) = self.maybe_auto_compact() {
-            self.notice = Some(report.clone());
+            self.notify(report.clone());
             self.conversation.add_message("assistant".into(), format!("_{}_", report));
         }
         let system_prompt = self.build_system_prompt();
@@ -656,7 +775,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{Config, ProviderConfig};
 
     /// App with an isolated HOME so session restore never leaks into a test.
     fn app_with(config: Config) -> App {
@@ -674,6 +793,75 @@ mod tests {
             None => unsafe { std::env::remove_var("HOME") },
         }
         app
+    }
+
+    /// A rejected `--model` on the command line has to stay on screen until a
+    /// switch actually lands, then get out of the way.
+    ///
+    /// The key comes from `providers[id].api_key`, not the environment: these
+    /// tests run in parallel, so mutating `OPENAI_API_KEY` would leak into
+    /// whatever else happens to be resolving a key at that moment.
+    #[test]
+    fn a_bad_model_arg_stays_until_a_switch_succeeds() {
+        let mut app = app_with(provcfg("testprov", Some("sk-cfg")));
+
+        // The exact shape of the `--model` arm in `new_with_config`.
+        match app.parse_model_arg("nosuch/model") {
+            Some((p, m)) => {
+                if let Err(e) = app.apply_provider_model(&p, &m) {
+                    app.notify_blocking_cause(e, NoticeCause::ProviderSwitch);
+                }
+            }
+            None => unreachable!("'nosuch/model' parses"),
+        }
+        let notice = app.notice.clone().expect("blocking notice");
+        assert!(notice.is_blocking(), "a rejected arg is blocking");
+        assert_eq!(notice.cause, NoticeCause::ProviderSwitch);
+
+        // Typing does not clear it...
+        app.clear_ephemeral_notice();
+        assert!(app.notice.is_some(), "must survive keystrokes");
+
+        // ...a good switch does.
+        assert!(app.apply_provider_model("testprov", "m1").is_ok());
+        assert!(
+            app.notice.is_none(),
+            "the successful switch resolves the rejected arg: {:?}",
+            app.notice
+        );
+    }
+
+    /// The reverse case: a provider with a key must retire a stale "no API
+    /// key" notice instead of leaving it to haunt the status line.
+    #[test]
+    fn a_successful_switch_retires_a_stale_missing_key_notice() {
+        let mut app = app_with(provcfg("nokey", None));
+        app.apply_provider_model("nokey", "m1").unwrap();
+        let notice = app.notice.clone().expect("no-key notice");
+        assert_eq!(notice.cause, NoticeCause::MissingKey, "text: {:?}", notice.text);
+
+        // A key arrives and the provider is reapplied — what a successful
+        // /login does.
+        app.config.providers.get_mut("nokey").unwrap().api_key = Some("sk-new".into());
+        app.apply_provider_model("nokey", "m1").unwrap();
+        assert!(
+            app.notice.is_none(),
+            "with a key in place the missing-key notice is over"
+        );
+    }
+
+    fn provcfg(id: &str, key: Option<&str>) -> Config {
+        let mut config = Config::default();
+        config.providers.insert(
+            id.into(),
+            ProviderConfig {
+                api: Some("openai".into()),
+                base_url: Some("http://127.0.0.1:9/v1".into()),
+                api_key: key.map(str::to_string),
+                models: vec!["m1".into()],
+            },
+        );
+        config
     }
 
     fn with_window(window: usize) -> Config {

@@ -407,19 +407,29 @@ fn prompt_draft_text(app: &App) -> String {
     display
 }
 
-/// Transient warning line above the prompt. Notices used to sit in the status
-/// bar, where a long message pushed everything else off screen.
+/// Status line above the prompt box.
+///
+/// Two levels: a message the user has to act on stays put and is drawn in the
+/// warning colour; confirmations and hints are muted and cleared by the next
+/// keystroke. They used to be one channel with one colour, so a blocking
+/// "no API key" looked exactly like "theme: barong".
 fn render_notice(frame: &mut Frame, area: Rect, app: &App) {
-    let Some(text) = &app.notice else { return };
+    let Some(notice) = &app.notice else { return };
     if area.height == 0 || area.width == 0 {
         return;
     }
     let t = &app.theme;
+    let color = if notice.is_blocking() {
+        t.warning
+    } else {
+        t.muted
+    };
+    let marker = if notice.is_blocking() { "!" } else { "▎" };
     let line = Line::from(vec![
-        Span::styled("▎ ", Style::default().fg(t.warning)),
+        Span::styled(format!("{} ", marker), Style::default().fg(color)),
         Span::styled(
-            truncate(text, area.width.saturating_sub(3) as usize),
-            Style::default().fg(t.warning),
+            truncate(&notice.text, area.width.saturating_sub(3) as usize),
+            Style::default().fg(color),
         ),
     ]);
     frame.render_widget(Paragraph::new(line), area);
