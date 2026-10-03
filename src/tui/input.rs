@@ -412,6 +412,16 @@ fn handle_login_key(app: &mut App, key: crossterm::event::KeyEvent) -> Result<()
     return Ok(());
 }
 
+/// Shift+Enter means "newline, don't submit" (Ctrl+J is the fallback that
+/// works everywhere). Only fires with kitty keyboard enhancement active;
+/// otherwise the terminal sends plain Enter and this is unreachable.
+fn is_shift_enter(key: crossterm::event::KeyEvent) -> bool {
+    key.code == KeyCode::Enter
+        && key.modifiers.contains(KeyModifiers::SHIFT)
+        && !key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
 /// What bare-`/xxx` Enter should do: run the command, or complete text first.
 ///
 /// Rules (predictable for every command):
@@ -620,6 +630,34 @@ pub fn expand_mentions(text: &str, root: &std::path::Path) -> (String, Vec<Strin
         out.push_str(&a);
     }
     (out, missing)
+}
+
+/// `@file` tokens in the input buffer (pure string scan, no I/O —
+/// safe to call every render frame). Mirrors the tokenizer in expand_mentions.
+pub fn mention_tokens(buffer: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_at = false;
+    for c in buffer.chars() {
+        if c == '@' {
+            in_at = true;
+            cur.clear();
+        } else if in_at {
+            if c.is_whitespace() || c == ',' || c == ')' || c == ']' {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+                in_at = false;
+            } else {
+                cur.push(c);
+            }
+        }
+    }
+    if in_at && !cur.is_empty() {
+        out.push(cur);
+    }
+    out.truncate(5);
+    out
 }
 
 pub fn handle_events(app: &mut App) -> Result<()> {
@@ -901,6 +939,13 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                 }
             }
             KeyCode::Enter => {
+                // Shift+Enter = newline (needs kitty keyboard enhancement,
+                // pushed in main; plain terminals keep sending plain Enter).
+                if is_shift_enter(key) {
+                    app.input.buffer.insert(app.input.cursor_pos, '\n');
+                    app.input.cursor_pos += 1;
+                    return Ok(());
+                }
                 // Bare `/xxx`: exact command runs, highlight completes,
                 // bare `/login`/`/model` open their pickers.
                 match bare_enter(&app.input.buffer, app.palette_idx, app.palette_navigated) {
@@ -1554,7 +1599,73 @@ mod tests {
     }
 
     #[test]
-    fn discovered_models_merge_first_without_dupes() {        let _guard = HOME_LOCK.lock().unwrap();
+    fn mention_tokens_scans_without_io() {        assert_eq!(
+            mention_tokens("fix @src/main.rs and @lib.rs now"),
+            vec!["src/main.rs".to_string(), "lib.rs".to_string()]
+        );
+        assert!(mention_tokens("no mentions here").is_empty());
+        assert_eq!(mention_tokens("@a,@b"), vec!["a".to_string(), "b".to_string()]);
+        assert!(mention_tokens("@").is_empty());
+        assert_eq!(mention_tokens("@a @a @a @a @a @a"), vec!["a".to_string(); 5], "capped at 5");
+    }
+
+    #[test]
+    fn shift_enter_means_newline_plain_enter_submits() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let shift = KeyEvent {
+            code: KeyCode::Enter,
+            modifiers: KeyModifiers::SHIFT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        };
+        assert!(is_shift_enter(shift));
+        let plain = KeyEvent {
+            code: KeyCode::Enter,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        };
+        assert!(!is_shift_enter(plain));
+        let ctrl_j = KeyEvent {
+            code: KeyCode::Char('j'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        };
+        assert!(!is_shift_enter(ctrl_j));
+    }
+
+    #[test]
+    fn input_footer_shows_provider_model() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = test_app();
+        // Type an @mention so chips render too.
+        app.input.buffer = "read @src/main.rs".into();
+        app.input.cursor_pos = app.input.buffer.len();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        // Layout: chat 0..19, input 19..22, footer 22, status 23.
+        let row: String = (0..80).map(|x| buf[(x, 22)].symbol().to_string()).collect();
+        assert!(row.contains(&app.provider_name), "footer: {}", row);
+        assert!(row.contains(&app.current_model), "footer: {}", row);
+        assert!(row.contains("@src/main.rs"), "footer: {}", row);
+        // Input zone is borderless (OpenCode-style): no box drawing, panel bg.
+        for y in 19..22 {
+            let line: String = (0..80).map(|x| buf[(x, y)].symbol().to_string()).collect();
+            assert!(!line.contains('╭') && !line.contains('╰') && !line.contains('╮') && !line.contains('╯'), "no box: {}", line);
+        }
+        assert_eq!(buf[(2, 19)].bg, app.theme.panel);
+        // Top breathing row is empty; typed text starts on the next row.
+        let pad: String = (0..80).map(|x| buf[(x, 19)].symbol().to_string()).collect();
+        assert!(pad.trim().is_empty(), "pad row: {:?}", pad);
+        let first: String = (0..80).map(|x| buf[(x, 20)].symbol().to_string()).collect();
+        assert!(first.contains("read @src/main.rs"), "content row: {}", first);
+    }
+
+    #[test]
+    fn discovered_models_merge_first_without_dupes() {
+        let _guard = HOME_LOCK.lock().unwrap();
         let app = test_app_locked();
         // Inject discovery results via temp-HOME cache file path (isolated).
         let tmp = std::env::temp_dir().join(format!("barong-model-repro-{}", std::process::id()));

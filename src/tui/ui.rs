@@ -13,6 +13,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             Constraint::Min(1),
             Constraint::Length(3),
             Constraint::Length(1),
+            Constraint::Length(1),
         ])
         .split(area);
 
@@ -43,10 +44,39 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     } else if app.input.buffer.starts_with('/') && idle {
         render_palette(frame, chunks[0], chunks[1], app);
     }
-    render_status(frame, chunks[2], app);
+    render_input_footer(frame, chunks[2], app);
+    render_status(frame, chunks[3], app);
     if app.pending_approval.is_some() {
         render_permission_modal(frame, area, app);
     }
+}
+
+/// OpenCode-style input footer: active `provider/model` at the typing point
+/// (status bar no longer duplicates it) + approval state + `@file` chips.
+fn render_input_footer(frame: &mut Frame, area: Rect, app: &App) {
+    let t = &app.theme;
+    let mut parts = vec![
+        Span::styled(
+            format!(" {}/{}", app.provider_name, truncate(&app.current_model, 32)),
+            Style::default().fg(t.accent),
+        ),
+    ];
+    parts.push(Span::styled(" · ", Style::default().fg(t.muted)));
+    if app.permission_gate.auto_approve() {
+        parts.push(Span::styled("auto", Style::default().fg(t.muted)));
+    } else {
+        parts.push(Span::styled("ask", Style::default().fg(t.warning)));
+    }
+    for f in crate::tui::input::mention_tokens(&app.input.buffer) {
+        parts.push(Span::styled(" · ", Style::default().fg(t.muted)));
+        parts.push(Span::styled(format!("@{}", truncate(&f, 24)), Style::default().fg(t.accent)));
+    }
+    if app.pending_login.is_some() {
+        parts.push(Span::styled(" · login…", Style::default().fg(t.warning)));
+    } else if app.pending_approval.is_some() {
+        parts.push(Span::styled(" · approval…", Style::default().fg(t.warning)));
+    }
+    frame.render_widget(Paragraph::new(Line::from(parts)), area);
 }
 
 fn render_tree(frame: &mut Frame, area: Rect, app: &App) {
@@ -229,41 +259,39 @@ fn truncate(s: &str, max: usize) -> String {
 fn render_input(frame: &mut Frame, area: Rect, app: &App) {
     let t = &app.theme;
     let busy = app.event_rx.is_some();
-    let mut title = if busy { " working… " } else { " › " };
-    if app.input.buffer.starts_with('/') {
-        title = " / ";
-    } else if app.input.buffer.contains('@') {
-        title = " @ ";
-    }
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Rounded)
-        .title(title)
-        .border_style(if busy {
-            Style::default().fg(t.warning)
-        } else {
-            Style::default().fg(t.muted)
-        });
+    // OpenCode-style: no border box — full-bleed panel backdrop + text.
+    // The backdrop is a borderless block so wrap/clip never breaks alignment.
+    frame.render_widget(
+        Block::default().style(Style::default().bg(t.panel)),
+        area,
+    );
+    // Small horizontal inset so text doesn't touch the terminal edge.
+    let inner = Rect::new(
+        area.x.saturating_add(1),
+        area.y,
+        area.width.saturating_sub(1),
+        area.height,
+    );
 
     if let Some(pid) = &app.pending_login {
         let masked = "•".repeat(app.login_buffer.chars().count().min(48));
         let line = Line::from(vec![
-            Span::styled(format!("key for {}: ", pid), Style::default().fg(t.accent)),
+            Span::styled(format!("key for {}: ", pid), Style::default().fg(t.accent).bg(t.panel)),
             Span::raw(masked),
-            Span::styled("█", Style::default().fg(t.accent).add_modifier(Modifier::SLOW_BLINK)),
+            Span::styled("█", Style::default().fg(t.accent).bg(t.panel).add_modifier(Modifier::SLOW_BLINK)),
         ]);
-        frame.render_widget(Paragraph::new(line).block(block), area);
+        frame.render_widget(Paragraph::new(line), inner);
         return;
     }
 
     if busy {
         let label = if app.pending_approval.is_some() {
-            " (y/a/n to decide)"
+            "(y/a/n to decide)"
         } else {
-            " (Esc to cancel)"
+            "(Esc to cancel)"
         };
-        let p = Paragraph::new(label).block(block).style(Style::default().fg(t.muted));
-        frame.render_widget(p, area);
+        let line = Line::from(Span::styled(label, Style::default().fg(t.muted).bg(t.panel)));
+        frame.render_widget(Paragraph::new(line), inner);
         return;
     }
 
@@ -272,18 +300,33 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
     if app.input.cursor_pos <= display.len() {
         display.insert(app.input.cursor_pos, '█');
     }
-    let hint = if display.is_empty() && !app.input.buffer.starts_with('/') {
-        Span::styled("message, / commands, @ files", Style::default().fg(t.muted))
+    let bg = Style::default().bg(t.panel);
+    // Breathing room: one empty row on top, content below it.
+    let mut rows = vec![Line::from(Span::styled("", bg))];
+    if app.input.buffer.is_empty() && !app.input.buffer.starts_with('/') {
+        rows.push(Line::from(vec![
+            Span::styled("█", Style::default().fg(t.accent).bg(t.panel)),
+            Span::styled("message, / commands, @ files", Style::default().fg(t.muted).bg(t.panel)),
+        ]));
     } else {
-        Span::raw("")
-    };
-    let inner = if display.is_empty() {
-        vec![Line::from(hint)]
-    } else {
-        vec![Line::from(Span::raw(display))]
-    };
-    let p = Paragraph::new(inner).block(block).wrap(Wrap { trim: false });
-    frame.render_widget(p, area);
+        rows.extend(
+            display
+                .split('\n')
+                .map(|row| Line::from(Span::styled(row.to_string(), bg))),
+        );
+    }
+    // Keep the cursor's row visible (Shift+Enter can grow past the box).
+    let cursor_row = 1 + display
+        .chars()
+        .take(app.input.cursor_pos)
+        .filter(|&c| c == '\n')
+        .count();
+    let visible = area.height.max(1) as usize;
+    let scroll = cursor_row.saturating_sub(visible.saturating_sub(1)) as u16;
+    let p = Paragraph::new(rows)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
+    frame.render_widget(p, inner);
 }
 
 fn render_palette(frame: &mut Frame, chat: Rect, input: Rect, app: &App) {
@@ -469,8 +512,6 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
     let ctx_color = if ctx > 85 { t.error } else if ctx > 60 { t.warning } else { t.muted };
     let mut parts = vec![
         Span::styled(format!(" {}", app.cwd_short()), Style::default().fg(t.muted)),
-        Span::styled(" │ ", Style::default().fg(t.muted)),
-        Span::styled(format!("{}/{}", app.provider_name, truncate(&app.current_model, 32)), Style::default().fg(t.accent)),
         Span::styled(" │ ", Style::default().fg(t.muted)),
         Span::styled(format!("msgs:{}", app.conversation.messages.len()), Style::default().fg(t.muted)),
         Span::styled(" │ ", Style::default().fg(t.muted)),

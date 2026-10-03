@@ -63,30 +63,40 @@ async fn run_tui(auto_approve: bool, provider: Option<&str>, model: Option<&str>
     // ratatui is sync; run it on blocking thread scope via existing loop.
     // We are already inside tokio runtime, App::start_agent spawns tasks onto it.
     let terminal = ratatui::init();
-    // Wheel scrolling needs explicit mouse capture; guard restores it on panic.
-    let _mouse = MouseGuard::new();
+    // Mouse wheel + disambiguated keys (Shift+Enter newline). Guard restores
+    // both on normal exit and on panic. Terminals without support ignore these.
+    let _term = TerminalGuard::new();
     let result = run_blocking(terminal, auto_approve, provider, model);
     ratatui::restore();
     result
 }
 
-struct MouseGuard;
+/// Restores terminal input modes on drop (normal return AND panic paths).
+struct TerminalGuard;
 
-impl MouseGuard {
+impl TerminalGuard {
     fn new() -> Self {
+        use crossterm::event::EnableMouseCapture;
+        use crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
         let _ = crossterm::execute!(
             std::io::stdout(),
-            crossterm::event::EnableMouseCapture
+            EnableMouseCapture,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+            )
         );
         Self
     }
 }
 
-impl Drop for MouseGuard {
+impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        use crossterm::event::{DisableMouseCapture, PopKeyboardEnhancementFlags};
         let _ = crossterm::execute!(
             std::io::stdout(),
-            crossterm::event::DisableMouseCapture
+            DisableMouseCapture,
+            PopKeyboardEnhancementFlags
         );
     }
 }
