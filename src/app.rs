@@ -31,6 +31,9 @@ pub struct App {
     pub mcp_servers: Vec<std::sync::Arc<std::sync::Mutex<McpServer>>>,
     pub chat_scroll: usize,
     pub should_auto_scroll: bool,
+    /// Messages typed while the agent was working. `Enter` queues instead of
+    /// discarding the draft; the queue is drained when the run finishes.
+    pub queued_input: Vec<String>,
     pub event_rx: Option<mpsc::Receiver<StreamEvent>>,
     pub streaming_text: String,
     pub provider: ProviderKind,
@@ -51,6 +54,13 @@ pub struct App {
     pub spinner_tick: usize,
     pub permission_gate: PermissionGate,
     pub pending_approval: Option<PendingTool>,
+    /// Prompt tokens the provider reported for the last request. This is the
+    /// only number we get that is not a guess, so it wins over the estimate.
+    pub last_prompt_tokens: Option<usize>,
+    /// Cached size of the prompt prefix that never changes between turns
+    /// (system prompt + tool schemas). Measured when a run starts instead of
+    /// rebuilt on every frame.
+    pub prompt_overhead_chars: usize,
     pub theme: Theme,
     pub tree_visible: bool,
     pub auth: AuthStore,
@@ -151,6 +161,7 @@ impl App {
             mcp_servers,
             chat_scroll: 0,
             should_auto_scroll: true,
+            queued_input: Vec::new(),
             event_rx: None,
             streaming_text: String::new(),
             provider,
@@ -174,6 +185,8 @@ impl App {
             spinner_tick: 0,
             permission_gate,
             pending_approval: None,
+            last_prompt_tokens: None,
+            prompt_overhead_chars: 0,
             theme,
             tree_visible: false,
             auth,
@@ -318,14 +331,61 @@ impl App {
         }
     }
 
-    /// Rough context usage 0..1 based on chars (~4 chars/token) vs 128k.
+    /// Fraction of the model's context window in use, 0..1.
+    ///
+    /// Uses the provider's own prompt-token count when it has reported one;
+    /// otherwise estimates from characters (~4 per token). The estimate covers
+    /// *everything we would send* — system prompt, tool schemas and the
+    /// transcript — because all of it occupies the window on every request.
     pub fn context_usage(&self) -> f32 {
-        let mut chars = self.workspace.file_tree.len() + self.workspace.summary().len();
+        let window = self.config.resolve_context_window() as f32;
+        let tokens = match self.last_prompt_tokens {
+            Some(reported) => {
+                // The answer so far is not in the reported count yet.
+                reported as f32 + self.streaming_text.len() as f32 / 4.0
+            }
+            None => self.estimated_prompt_tokens() as f32,
+        };
+        (tokens / window).clamp(0.0, 1.0)
+    }
+
+    /// True while the number on screen is an estimate rather than a count the
+    /// provider gave us.
+    pub fn context_is_estimated(&self) -> bool {
+        self.last_prompt_tokens.is_none()
+    }
+
+    /// chars/4 over the whole outgoing payload. `prompt_overhead_chars` is
+    /// refreshed on every run; the file tree is counted once, not twice.
+    fn estimated_prompt_tokens(&self) -> usize {
+        let mut chars = self.prompt_overhead_chars;
         for m in &self.conversation.messages {
             chars += m.content.as_deref().unwrap_or("").len();
         }
         chars += self.streaming_text.len();
-        (chars as f32 / 4.0 / 128_000.0).clamp(0.0, 1.0)
+        chars / 4
+    }
+
+    /// The system prompt sent with every request: instructions + workspace
+    /// context (AGENTS.md, git state, file tree).
+    fn build_system_prompt(&self) -> String {
+        format!(
+            "{}\n\n## Workspace Context\n{}",
+            include_str!("../prompts/system.md"),
+            self.workspace.summary(),
+        )
+    }
+
+    /// Measure the constant part of the prompt. Called when a run starts (and
+    /// after `/reload`), never per frame — `workspace.summary()` rebuilds the
+    /// whole file tree on every call.
+    fn refresh_prompt_overhead(&mut self, system_prompt: &str) {
+        let mut chars = system_prompt.len();
+        for def in self.tool_registry.definitions() {
+            chars += def.name.len() + def.description.len();
+            chars += def.input_schema.to_string().len();
+        }
+        self.prompt_overhead_chars = chars;
     }
 
     pub fn auto_compact_threshold(&self) -> f32 {
@@ -382,6 +442,7 @@ impl App {
     pub fn handle_stream(&mut self) -> Result<()> {
         // Deferred persist: the rx borrow below forbids &mut self calls inline.
         let mut dirty = false;
+        let mut run_finished = false;
         if let Some(rx) = &mut self.event_rx {
             loop {
                 match rx.try_recv() {
@@ -392,6 +453,8 @@ impl App {
                     Ok(StreamEvent::Usage { input_tokens, output_tokens }) => {
                         self.status.token_count =
                             format!("in:{} out:{}", input_tokens, output_tokens);
+                        // Authoritative context reading for the ctx gauge.
+                        self.last_prompt_tokens = Some(input_tokens as usize);
                     }
                     Ok(StreamEvent::ToolCall { id: _, name, args }) => {
                         // Flush pending assistant text before tool block.
@@ -434,6 +497,7 @@ impl App {
                         self.permission_gate.clear_pending();
                         self.status.tool_status = "idle".into();
                         self.should_auto_scroll = true;
+                        run_finished = true;
                         break;
                     }
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
@@ -447,6 +511,7 @@ impl App {
                         self.pending_approval = None;
                         self.permission_gate.clear_pending();
                         self.status.tool_status = "idle".into();
+                        run_finished = true;
                         break;
                     }
                 }
@@ -455,7 +520,32 @@ impl App {
         if dirty {
             self.save_session();
         }
+        if run_finished {
+            // Fire queued messages one live turn at a time. A turn that refuses
+            // to start (missing key, bad provider) must not stall the rest, so
+            // keep draining while idle — bounded by the queue length, and each
+            // pass either starts a run (loop ends) or shrinks the queue.
+            let mut budget = self.queued_input.len();
+            while budget > 0 && self.event_rx.is_none() && !self.queued_input.is_empty() {
+                budget -= 1;
+                self.drain_queued_input();
+            }
+        }
         Ok(())
+    }
+
+    /// Send the next queued message once the agent goes idle. Runs at most one
+    /// per call so each drain re-enters the same stream → Done → drain path.
+    pub fn drain_queued_input(&mut self) {
+        if self.event_rx.is_some() || self.queued_input.is_empty() {
+            return;
+        }
+        let next = self.queued_input.remove(0);
+        // A failure here (e.g. missing key) leaves event_rx None, so the next
+        // frame drains the rest — no spin, the queue always shrinks.
+        if let Err(e) = crate::tui::input::submit_message(self, next) {
+            self.notice = Some(format!("queued message failed: {}", e));
+        }
     }
 
     pub fn session_meta(&self) -> crate::session::SessionMeta {
@@ -507,17 +597,21 @@ impl App {
         servers
     }
 
+    /// Re-measure the prompt overhead after the workspace changed on disk.
+    pub fn refresh_prompt_overhead_for_reload(&mut self) {
+        let prompt = self.build_system_prompt();
+        self.refresh_prompt_overhead(&prompt);
+    }
+
     pub fn start_agent(&mut self) {
         if let Some(report) = self.maybe_auto_compact() {
             self.notice = Some(report.clone());
             self.conversation.add_message("assistant".into(), format!("_{}_", report));
         }
-        let context_block = self.workspace.summary();
-        let system_prompt = format!(
-            "{}\n\n## Workspace Context\n{}",
-            include_str!("../prompts/system.md"),
-            context_block,
-        );
+        let system_prompt = self.build_system_prompt();
+        // The reported count belongs to the request we are about to replace.
+        self.last_prompt_tokens = None;
+        self.refresh_prompt_overhead(&system_prompt);
         self.conversation.set_system_prompt(system_prompt);
 
         let api_key = self.api_key();
@@ -556,5 +650,119 @@ impl App {
         self.event_rx = Some(rx);
         self.streaming_text = String::new();
         self.status.tool_status = "processing...".into();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    /// App with an isolated HOME so session restore never leaks into a test.
+    fn app_with(config: Config) -> App {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let tmp = std::env::temp_dir()
+            .join(format!("barong-ctx-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let orig = std::env::var("HOME").ok();
+        // SAFETY: single-threaded test body; HOME is restored before returning.
+        unsafe { std::env::set_var("HOME", &tmp) };
+        let app = App::new_with_config(config, vec![]);
+        match orig {
+            Some(o) => unsafe { std::env::set_var("HOME", o) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        app
+    }
+
+    fn with_window(window: usize) -> Config {
+        Config {
+            context_window: Some(window),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn window_is_configurable_and_sane() {
+        assert_eq!(Config::default().resolve_context_window(), 128_000);
+        assert_eq!(with_window(1_000_000).resolve_context_window(), 1_000_000);
+        assert_eq!(with_window(8_000).resolve_context_window(), 8_000);
+        // Nonsense values fall back to the default rather than dividing by ~0.
+        assert_eq!(with_window(0).resolve_context_window(), 128_000);
+        assert_eq!(with_window(10).resolve_context_window(), 128_000);
+    }
+
+    #[test]
+    fn gauge_uses_the_configured_window() {
+        let mut app = app_with(with_window(10_000));
+        // ~40k chars of transcript ≈ 10k tokens → 100% of a 10k window.
+        app.conversation
+            .add_message("user".into(), "x".repeat(40_000));
+        let usage = app.context_usage();
+        assert!(usage > 0.9, "small window must look full, got {}", usage);
+        // The same transcript against a 1M window is a rounding error.
+        let mut big = app_with(with_window(1_000_000));
+        big.conversation.add_message("user".into(), "x".repeat(40_000));
+        assert!(
+            big.context_usage() < 0.02,
+            "1M window must not look full, got {}",
+            big.context_usage()
+        );
+    }
+
+    #[test]
+    fn provider_count_beats_the_estimate() {
+        let mut app = app_with(with_window(100_000));
+        app.conversation.add_message("user".into(), "short".into());
+        assert!(app.context_is_estimated());
+        // What the provider reported for the request it just handled.
+        app.last_prompt_tokens = Some(75_000);
+        assert!(!app.context_is_estimated());
+        let usage = app.context_usage();
+        assert!((0.74..=0.77).contains(&usage), "got {}", usage);
+        // Streamed text counts on top of the reported prompt.
+        app.streaming_text = "x".repeat(4_000); // ~1k tokens
+        assert!(app.context_usage() > usage, "streaming must add up");
+    }
+
+    #[test]
+    fn overhead_counts_the_prompt_once() {
+        let mut app = app_with(with_window(100_000));
+        app.refresh_prompt_overhead_for_reload();
+        let overhead = app.prompt_overhead_chars;
+        assert!(overhead > 0, "system prompt must be measured");
+
+        // Exact composition: instructions + workspace summary + tool schemas.
+        // The old code added `file_tree.len()` on top of `summary()`, which
+        // already contains the tree — so this would be over by exactly that.
+        let tools: usize = app
+            .tool_registry
+            .definitions()
+            .iter()
+            .map(|d| d.name.len() + d.description.len() + d.input_schema.to_string().len())
+            .sum();
+        let expected = include_str!("../prompts/system.md").len()
+            + "\n\n## Workspace Context\n".len()
+            + app.workspace.summary().len()
+            + tools;
+        assert_eq!(
+            overhead, expected,
+            "overhead must be the sum of its parts, nothing counted twice"
+        );
+
+        // Token estimate is chars/4 and stays below the raw char count.
+        assert!(app.estimated_prompt_tokens() <= overhead / 4);
+    }
+
+    #[test]
+    fn clearing_resets_the_gauge() {
+        let mut app = app_with(with_window(100_000));
+        app.last_prompt_tokens = Some(90_000);
+        assert!(app.context_usage() > 0.8);
+        app.conversation = crate::agent::conversation::Conversation::new();
+        app.last_prompt_tokens = None;
+        assert!(app.context_usage() < 0.01, "got {}", app.context_usage());
+        assert!(app.context_is_estimated());
     }
 }

@@ -32,6 +32,10 @@ OpenAI-compatible endpoint goes in `barong.jsonc`:
 ```jsonc
 {
   "provider": "openrouter",
+  // Context window of the active model in tokens. Drives the `ctx:%` gauge and
+  // auto-compact; defaults to 128k. The gauge shows `ctx:~12%` while it is an
+  // estimate and `ctx:12%` once the provider reports real prompt tokens.
+  "context_window": 200000,
   "providers": {
     "kantor": {
       "base_url": "https://proxy.local/v1",

@@ -296,7 +296,10 @@ impl MarkdownRenderer {
         if col_widths.is_empty() {
             return;
         }
-
+        // Fit the terminal. Without this the box is wider than the viewport,
+        // `Paragraph` wraps it and the rule characters end up mid-row.
+        let col_widths = fit_columns(col_widths, self.width as usize);
+        let col_widths = &col_widths;
         let sep_style = Style::default().fg(self.muted);
         let header_style = Style::default()
             .fg(self.accent)
@@ -330,20 +333,26 @@ impl MarkdownRenderer {
             spans.push(Span::styled("│ ", sep_style));
             for i in 0..ncols {
                 let cell = cells.get(i).map(|s| s.as_str()).unwrap_or("");
+                let col = col_widths[i];
                 if header {
-                    let text = plain(cell);
-                    let pad = col_widths[i].saturating_sub(display_width(&text));
-                    spans.push(Span::styled(text, header_style));
-                    spans.push(Span::styled(" ".repeat(pad), header_style));
+                    // Header stays plain text (one span) so it reads as a label.
+                    let text = Span::raw(plain(cell));
+                    let (clipped, w) = clip_spans(std::slice::from_ref(&text), col);
+                    for s in clipped {
+                        spans.push(Span::styled(s.content.into_owned(), header_style));
+                    }
+                    spans.push(Span::styled(" ".repeat(col.saturating_sub(w)), header_style));
                 } else {
                     // Owned copies: cell borrows die with this loop iteration,
                     // but the line outlives it.
-                    let cell_spans = self.parse_inline(cell);
-                    let w: usize = cell_spans.iter().map(|s| display_width(s.content.as_ref())).sum();
-                    for s in cell_spans {
+                    let (clipped, w) = clip_spans(&self.parse_inline(cell), col);
+                    for s in clipped {
                         spans.push(Span::styled(s.content.into_owned(), s.style));
                     }
-                    spans.push(Span::styled(" ".repeat(col_widths[i].saturating_sub(w)), Style::default()));
+                    spans.push(Span::styled(
+                        " ".repeat(col.saturating_sub(w)),
+                        Style::default(),
+                    ));
                 }
                 if i < ncols - 1 {
                     spans.push(Span::styled(" │ ", sep_style));
@@ -432,7 +441,9 @@ impl MarkdownRenderer {
                     chars.next();
                     chars.next();
                 }
-            } else if text[i..].starts_with("# ") {
+            } else if i == 0 && text.starts_with("# ") {
+                // Headings only at the start of the line: matching "# " anywhere
+                // else turned "C# coding" into a heading and ate the rest.
                 spans.push(Span::styled(
                     &text[i + 2..],
                     Style::default()
@@ -440,7 +451,7 @@ impl MarkdownRenderer {
                         .add_modifier(Modifier::BOLD),
                 ));
                 break;
-            } else if text[i..].starts_with("## ") {
+            } else if i == 0 && text.starts_with("## ") {
                 spans.push(Span::styled(
                     &text[i + 3..],
                     Style::default()
@@ -448,7 +459,7 @@ impl MarkdownRenderer {
                         .add_modifier(Modifier::BOLD),
                 ));
                 break;
-            } else if text[i..].starts_with("### ") {
+            } else if i == 0 && text.starts_with("### ") {
                 spans.push(Span::styled(
                     &text[i + 4..],
                     Style::default()
@@ -470,6 +481,88 @@ impl MarkdownRenderer {
 fn display_width(s: &str) -> usize {
     use unicode_width::UnicodeWidthStr;
     s.width()
+}
+
+/// Longest prefix of `s` that fits in `max` cells.
+fn take_cells(s: &str, max: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let mut out = String::new();
+    let mut w = 0usize;
+    for c in s.chars() {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if w + cw > max {
+            break;
+        }
+        w += cw;
+        out.push(c);
+    }
+    out
+}
+
+/// Trim inline spans to `max` cells, marking the cut with an ellipsis so a
+/// squeezed column never spills into the next one. Returns the kept spans and
+/// their rendered width.
+fn clip_spans<'a>(spans: &[Span<'a>], max: usize) -> (Vec<Span<'a>>, usize) {
+    let total: usize = spans
+        .iter()
+        .map(|s| display_width(s.content.as_ref()))
+        .sum();
+    if total <= max {
+        return (spans.to_vec(), total);
+    }
+    if max == 0 {
+        return (Vec::new(), 0);
+    }
+    let budget = max - 1; // the ellipsis needs a cell of its own
+    let mut out: Vec<Span<'a>> = Vec::new();
+    let mut w = 0usize;
+    for s in spans {
+        if w >= budget {
+            break;
+        }
+        let sw = display_width(s.content.as_ref());
+        if w + sw <= budget {
+            out.push(s.clone());
+            w += sw;
+            continue;
+        }
+        let head = take_cells(s.content.as_ref(), budget - w);
+        w += display_width(&head);
+        if !head.is_empty() {
+            out.push(Span::styled(head, s.style));
+        }
+        break;
+    }
+    out.push(Span::styled("…", Style::default()));
+    (out, w + 1)
+}
+
+/// Shrink the widest columns until the table fits `avail` cells. `avail == 0`
+/// means "width unknown" (no viewport to fit into) — leave natural widths.
+fn fit_columns(mut widths: Vec<usize>, avail: usize) -> Vec<usize> {
+    if avail == 0 || widths.is_empty() {
+        return widths;
+    }
+    // "│ " + " │" borders, " │ " between columns, 2 spaces of padding per cell.
+    let budget = avail.saturating_sub(4 + 3 * (widths.len() - 1));
+    loop {
+        let used: usize = widths.iter().map(|w| w + 2).sum();
+        if used <= budget {
+            break;
+        }
+        // Take a cell off the widest column that still has something to give.
+        let Some(i) = widths
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| **w > 1)
+            .max_by_key(|(_, w)| **w)
+            .map(|(i, _)| i)
+        else {
+            break;
+        };
+        widths[i] -= 1;
+    }
+    widths
 }
 
 /// Wrap owned highlight spans to `max_width` cells, splitting styles across
@@ -752,5 +845,149 @@ mod tests {
         assert!(out[1].trim_start_matches(['▎', ' ']).is_empty(), "gap, got: {}", out[1]);
         assert!(out[3].trim_start_matches(['▎', ' ']).is_empty(), "gap, got: {}", out[3]);
         assert!(out[2].contains('1'), "gutter, got: {}", out[2]);
+    }
+
+    // --- #10: a "# " in mid-line is not a heading ---
+
+    #[test]
+    fn hash_mid_line_is_not_a_heading() {
+        use ratatui::style::Modifier;
+        for text in [
+            "Upgrade C# support today",
+            "see issue # 42 for details",
+            "a # b # c",
+            "C# and F# are languages",
+        ] {
+            let md = MarkdownRenderer::new();
+            let out = md.render(text, "assistant");
+            assert_eq!(out.len(), 1, "must stay one line: {:?}", text);
+            let s = flat(&out);
+            assert_eq!(s[0], text, "text must be preserved verbatim: {:?}", s[0]);
+            assert!(
+                !out[0]
+                    .spans
+                    .iter()
+                    .any(|sp| sp.style.add_modifier.contains(Modifier::BOLD)),
+                "no heading styling for {:?}",
+                text
+            );
+        }
+    }
+
+    #[test]
+    fn real_headings_still_render() {
+        use ratatui::style::Modifier;
+        let md = MarkdownRenderer::new();
+        for (src, marker) in [
+            ("# Top level", "Top level"),
+            ("## Second level", "Second level"),
+            ("### Third level", "Third level"),
+        ] {
+            let out = md.render(src, "assistant");
+            assert_eq!(out.len(), 1, "{}", src);
+            assert_eq!(flat(&out)[0], marker, "stars must go: {:?}", src);
+            assert!(
+                out[0].spans.iter().any(|s| s.style.add_modifier.contains(Modifier::BOLD)),
+                "heading must stay bold: {}",
+                src
+            );
+        }
+        // Headings after a quote or bullet are headings too.
+        let out = md.render("> # quoted heading", "assistant");
+        assert!(flat(&out)[0].contains("quoted heading"), "got: {:?}", flat(&out));
+        let out = md.render("- ## item heading", "assistant");
+        assert!(flat(&out)[0].contains("item heading"), "got: {:?}", flat(&out));
+    }
+
+    // --- #7: a wide table must fit the terminal or the box is destroyed ---
+
+    #[test]
+    fn wide_table_is_clamped_to_the_width() {
+        let md = MarkdownRenderer::new().with_width(40);
+        let text = format!(
+            "| Nama | Keterangan |\n|---|---|\n| alpha | {} |\n| b | c |",
+            "y".repeat(45)
+        );
+        let out = md.render(&text, "assistant");
+        for (i, l) in out.iter().enumerate() {
+            assert!(
+                l.width() <= 40,
+                "row {} is {} cells wide:\n{}",
+                i,
+                l.width(),
+                flat(&out).join("\n")
+            );
+        }
+        let rows = flat(&out);
+        assert!(rows[0].starts_with('┌') && rows[0].ends_with('┐'), "top rule: {:?}", rows[0]);
+        assert!(
+            rows.iter().any(|r| r.starts_with('└') && r.ends_with('┘')),
+            "bottom rule: {:?}",
+            rows
+        );
+        assert!(
+            rows.iter().any(|r| r.contains('…')),
+            "clipped cell must show an ellipsis:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    #[test]
+    fn narrow_table_still_keeps_every_column() {
+        let md = MarkdownRenderer::new().with_width(20);
+        let text = "| a | b | c |\n|---|---|---|\n| 1 | 2 | 3 |";
+        let rows = flat(&md.render(text, "assistant"));
+        let body = rows.iter().find(|r| r.contains('1')).expect("body row");
+        for cell in ["1", "2", "3"] {
+            assert!(body.contains(cell), "column {} lost: {:?}", cell, body);
+        }
+    }
+
+    #[test]
+    fn table_that_fits_is_untouched() {
+        use unicode_width::UnicodeWidthStr;
+        let md = MarkdownRenderer::new().with_width(80);
+        let text = "| Nama | Keterangan |\n|---|---|\n| alpha | pendek |";
+        let rows = flat(&md.render(text, "assistant"));
+        assert!(!rows.iter().any(|r| r.contains('…')), "no clipping needed: {:?}", rows);
+        assert!(rows[3].contains("alpha"), "body row: {:?}", rows);
+        let natural = rows[1].width();
+        assert!(natural < 80, "natural width {} is well under 80", natural);
+    }
+
+    #[test]
+    fn unknown_width_leaves_tables_alone() {
+        // `MarkdownRenderer::new()` has no viewport: clamping must not kick in.
+        let md = MarkdownRenderer::new();
+        let text = "| Nama | Keterangan |\n|---|---|\n| alpha | xyz |";
+        let rows = flat(&md.render(text, "assistant"));
+        assert!(!rows.iter().any(|r| r.contains('…')), "got: {:?}", rows);
+        assert!(rows[1].contains("Keterangan"), "got: {:?}", rows);
+    }
+
+    #[test]
+    fn fit_columns_only_shrinks() {
+        assert_eq!(fit_columns(vec![5, 5], 0), vec![5, 5], "unknown width");
+        // 40 - (4 borders + 3 separator) = 33 usable; 2 cells cost 12+12 = 24.
+        let w = fit_columns(vec![10, 10], 40);
+        assert_eq!(w, vec![10, 10], "already fits, untouched");
+        // Too wide: the widest column gives cells back until it fits.
+        let w = fit_columns(vec![10, 10], 20);
+        assert_eq!(w.iter().map(|x| x + 2).sum::<usize>(), 13, "{:?}", w);
+        assert!(w.iter().all(|x| *x <= 10), "never grows: {:?}", w);
+        assert_eq!(fit_columns(vec![4, 4], 8), vec![1, 1], "degenerate width");
+    }
+
+    #[test]
+    fn clip_spans_marks_the_cut() {
+        let spans = vec![Span::raw("abcdefghij")];
+        let (out, w) = clip_spans(&spans, 5);
+        assert_eq!(w, 5);
+        assert_eq!(display_width(&out[0].content), 4);
+        assert_eq!(out[1].content, "…");
+        // Fits exactly: untouched, no ellipsis.
+        let (out, w) = clip_spans(&spans, 10);
+        assert_eq!((out.len(), w), (1, 10));
+        assert_eq!(clip_spans(&spans, 0).0.len(), 0);
     }
 }

@@ -5,11 +5,48 @@ use std::sync::atomic::Ordering;
 
 pub struct InputState {
     pub buffer: String,
+    /// Byte offset into `buffer`, always on a char boundary. Never index
+    /// `buffer` with it directly — go through the cursor methods below, they
+    /// snap to a boundary first (a raw char count panics on multi-byte UTF-8).
     pub cursor_pos: usize,
     pub focused: bool,
     pub history: Vec<String>,
     pub history_index: Option<usize>,
     pub saved_buffer: String,
+}
+
+/// Largest char boundary at or below `at` (idempotent).
+fn floor_boundary(s: &str, at: usize) -> usize {
+    let at = at.min(s.len());
+    if s.is_char_boundary(at) {
+        return at;
+    }
+    prev_boundary(s, at)
+}
+
+/// Largest char boundary strictly below `at` — i.e. where the char ending at
+/// `at` starts. Distinct from `floor_boundary`, which keeps `at` itself.
+fn prev_boundary(s: &str, at: usize) -> usize {
+    let mut i = at.min(s.len());
+    while i > 0 {
+        i -= 1;
+        if s.is_char_boundary(i) {
+            return i;
+        }
+    }
+    0
+}
+
+/// Smallest char boundary strictly above `at`.
+fn next_boundary(s: &str, at: usize) -> usize {
+    let mut i = at.min(s.len());
+    while i < s.len() {
+        i += 1;
+        if s.is_char_boundary(i) {
+            return i;
+        }
+    }
+    s.len()
 }
 
 impl InputState {
@@ -21,6 +58,111 @@ impl InputState {
             history: Vec::new(),
             history_index: None,
             saved_buffer: String::new(),
+        }
+    }
+
+    /// `cursor_pos` clamped into the buffer and onto a char boundary. Safe to
+    /// feed straight into slicing or `String::insert`.
+    pub fn cursor(&self) -> usize {
+        floor_boundary(&self.buffer, self.cursor_pos)
+    }
+
+    pub fn set_cursor(&mut self, byte: usize) {
+        self.cursor_pos = byte;
+        self.cursor_pos = self.cursor();
+    }
+
+    pub fn move_cursor_home(&mut self) {
+        self.cursor_pos = 0;
+    }
+
+    pub fn move_cursor_end(&mut self) {
+        self.cursor_pos = self.buffer.len();
+    }
+
+    pub fn insert_char(&mut self, c: char) {
+        let mut utf8 = [0u8; 4];
+        self.insert_str(c.encode_utf8(&mut utf8));
+    }
+
+    pub fn insert_str(&mut self, s: &str) {
+        if s.is_empty() {
+            return;
+        }
+        let at = self.cursor();
+        self.buffer.insert_str(at, s);
+        self.cursor_pos = at + s.len();
+    }
+
+    pub fn insert_newline(&mut self) {
+        self.insert_char('\n');
+    }
+
+    /// Delete the char before the cursor.
+    pub fn backspace(&mut self) {
+        let at = self.cursor();
+        if at == 0 {
+            return;
+        }
+        let start = prev_boundary(&self.buffer, at);
+        self.buffer.replace_range(start..at, "");
+        self.cursor_pos = start;
+    }
+
+    /// Delete the char under the cursor.
+    pub fn delete(&mut self) {
+        let at = self.cursor();
+        let end = next_boundary(&self.buffer, at);
+        if end > at {
+            self.buffer.replace_range(at..end, "");
+            self.cursor_pos = at;
+        }
+    }
+
+    pub fn move_left(&mut self) {
+        self.cursor_pos = prev_boundary(&self.buffer, self.cursor());
+    }
+
+    pub fn move_right(&mut self) {
+        self.cursor_pos = next_boundary(&self.buffer, self.cursor());
+    }
+
+    /// Ctrl+U: drop everything before the cursor.
+    pub fn delete_before_cursor(&mut self) {
+        let at = self.cursor();
+        self.buffer.replace_range(..at, "");
+        self.cursor_pos = 0;
+    }
+
+    /// Ctrl+K: drop everything from the cursor on.
+    pub fn delete_to_cursor(&mut self) {
+        let at = self.cursor();
+        self.buffer.truncate(at);
+    }
+
+    /// Ctrl+W: drop the word before the cursor.
+    pub fn delete_word_before(&mut self) {
+        let at = self.cursor();
+        let head = &self.buffer[..at];
+        let trimmed = head.trim_end();
+        let start = trimmed.rfind([' ', '\n']).map(|i| i + 1).unwrap_or(0);
+        self.buffer.replace_range(start..at, "");
+        self.cursor_pos = start;
+    }
+
+    /// Start of the word left of the cursor (Alt+Left).
+    pub fn word_start_before(&self) -> usize {
+        let head = &self.buffer[..self.cursor()];
+        let trimmed = head.trim_end();
+        trimmed.rfind([' ', '\n']).map(|i| i + 1).unwrap_or(0)
+    }
+
+    /// First char after the word right of the cursor (Alt+Right).
+    pub fn word_end_after(&self) -> usize {
+        let at = self.cursor();
+        match self.buffer[at..].find([' ', '\n']) {
+            Some(i) => at + i + 1,
+            None => self.buffer.len(),
         }
     }
 
@@ -613,10 +755,11 @@ fn reset_picker(app: &mut App) {
 }
 
 fn complete_mention(app: &mut App) {
-    // find @partial before cursor
-    let before: String = app.input.buffer.chars().take(app.input.cursor_pos).collect();
-    let Some(at) = before.rfind('@') else { return };
-    let partial = &before[at + 1..];
+    // find @partial before cursor (byte offsets throughout)
+    let cursor = app.input.cursor();
+    let head = app.input.buffer[..cursor].to_string();
+    let Some(at) = head.rfind('@') else { return };
+    let partial = &head[at + 1..];
     if partial.contains(' ') || partial.contains('\n') {
         return;
     }
@@ -626,34 +769,21 @@ fn complete_mention(app: &mut App) {
         return;
     }
     if matches.len() == 1 {
-        // insert remainder + space (byte-safe rebuild)
-        let buf = app.input.buffer.clone();
-        let pos = app.input.cursor_pos;
-        // recompute byte index of cursor
-        let mut byte_cursor = buf.len();
-        let mut cpos = 0usize;
-        for (b, _) in buf.char_indices() {
-            if cpos == pos {
-                byte_cursor = b;
-                break;
-            }
-            cpos += 1;
-        }
-        let before = &buf[..byte_cursor.min(buf.len())];
-        let after = &buf[byte_cursor.min(buf.len())..];
+        // insert remainder + space
+        let after = app.input.buffer[cursor..].trim_start().to_string();
         let rest = matches[0].strip_prefix(partial).unwrap_or(&matches[0]);
-        let new_buf = format!("{}{} {}", before, rest, after.trim_start());
-        let new_cursor = before.len() + rest.len() + 1;
-        app.input.buffer = new_buf;
-        app.input.cursor_pos = new_cursor.min(app.input.buffer.len());
+        let new_cursor = cursor + rest.len() + 1;
+        app.input.buffer = format!("{}{}{}", &app.input.buffer[..cursor], rest, after);
+        app.input.set_cursor(new_cursor);
         return;
     }
-    // multiple: show in notice + complete common prefix
+    // multiple: show in notice + complete common prefix. The match filter is
+    // `contains`, so `partial` is not always a prefix of the common prefix —
+    // only extend when it is, else `common[partial.len()..]` is not a boundary.
     let common = common_prefix(&matches);
-    if common.len() > partial.len() {
-        let extra = &common[partial.len()..];
-        app.input.buffer.insert_str(app.input.cursor_pos, extra);
-        app.input.cursor_pos += extra.len();
+    if common.len() > partial.len() && common.starts_with(partial) {
+        let extra = common[partial.len()..].to_string();
+        app.input.insert_str(&extra);
     }
     app.notice = Some(format!("{} matches: {}", matches.len(), matches.iter().take(3).cloned().collect::<Vec<_>>().join(", ")));
 }
@@ -734,10 +864,11 @@ pub fn expand_mentions(text: &str, root: &std::path::Path) -> (String, Vec<Strin
         let p = if cand.exists() { cand } else { std::path::PathBuf::from(t) };
         match std::fs::read_to_string(&p) {
             Ok(content) => {
-                let capped = if content.len() > 8000 {
-                    format!("{}…\n[truncated]", &content[..8000])
-                } else {
-                    content
+                // Cut on a char boundary: a fixed byte offset panics when a
+                // multi-byte char straddles it.
+                let capped = match crate::text::truncate_bytes(&content, 8000) {
+                    Some(head) => format!("{}…\n[truncated]", head),
+                    None => content,
                 };
                 attached.push(format!("\n\n<file path=\"{}\">\n{}\n</file>", t, capped));
             }
@@ -832,32 +963,27 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                     return Ok(());
                 }
                 KeyCode::Char('u') => {
-                    app.input.buffer.drain(..app.input.cursor_pos.min(app.input.buffer.len()));
-                    app.input.cursor_pos = 0;
+                    app.input.delete_before_cursor();
                     return Ok(());
                 }
                 KeyCode::Char('k') => {
-                    app.input.buffer.truncate(app.input.cursor_pos.min(app.input.buffer.len()));
+                    app.input.delete_to_cursor();
                     return Ok(());
                 }
                 KeyCode::Char('w') => {
-                    let end = app.input.cursor_pos.min(app.input.buffer.len());
-                    let start = app.input.buffer[..end].rfind([' ', '\n']).map(|i| i + 1).unwrap_or(0);
-                    app.input.buffer.drain(start..end);
-                    app.input.cursor_pos = start;
+                    app.input.delete_word_before();
                     return Ok(());
                 }
                 KeyCode::Char('a') => {
-                    app.input.cursor_pos = 0;
+                    app.input.move_cursor_home();
                     return Ok(());
                 }
                 KeyCode::Char('e') => {
-                    app.input.cursor_pos = app.input.buffer.len();
+                    app.input.move_cursor_end();
                     return Ok(());
                 }
                 KeyCode::Char('j') => {
-                    app.input.buffer.insert(app.input.cursor_pos, '\n');
-                    app.input.cursor_pos += 1;
+                    app.input.insert_newline();
                     return Ok(());
                 }
                 KeyCode::Char('o') | KeyCode::Char('O') => {
@@ -878,18 +1004,11 @@ pub fn handle_events(app: &mut App) -> Result<()> {
             // Alt+Left/Right word jump (best-effort)
             match key.code {
                 KeyCode::Left => {
-                    let end = app.input.cursor_pos.min(app.input.buffer.len());
-                    let prev = app.input.buffer[..end].rfind([' ', '\n']).map(|i| i + 1).unwrap_or(0);
-                    app.input.cursor_pos = prev;
+                    app.input.cursor_pos = app.input.word_start_before();
                     return Ok(());
                 }
                 KeyCode::Right => {
-                    let rest = &app.input.buffer[app.input.cursor_pos.min(app.input.buffer.len())..];
-                    if let Some(i) = rest.find([' ', '\n']) {
-                        app.input.cursor_pos += i + 1;
-                    } else {
-                        app.input.cursor_pos = app.input.buffer.len();
-                    }
+                    app.input.cursor_pos = app.input.word_end_after();
                     return Ok(());
                 }
                 _ => {}
@@ -898,39 +1017,24 @@ pub fn handle_events(app: &mut App) -> Result<()> {
 
         match key.code {
             KeyCode::Char(c) => {
-                app.input.buffer.insert(app.input.cursor_pos, c);
-                app.input.cursor_pos += 1;
+                app.input.insert_char(c);
                 reset_picker(app);
             }
             KeyCode::Backspace => {
-                if app.input.cursor_pos > 0 && !app.input.buffer.is_empty() {
-                    // handle byte boundary safely
-                    let mut idx = app.input.cursor_pos - 1;
-                    while idx > 0 && !app.input.buffer.is_char_boundary(idx) {
-                        idx -= 1;
-                    }
-                    if app.input.cursor_pos <= app.input.buffer.len() && app.input.buffer.is_char_boundary(app.input.cursor_pos) {
-                        app.input.buffer.remove(idx);
-                        app.input.cursor_pos = idx;
-                    }
-                }
+                app.input.backspace();
                 reset_picker(app);
             }
             KeyCode::Delete => {
-                if app.input.cursor_pos < app.input.buffer.len() {
-                    app.input.buffer.remove(app.input.cursor_pos);
-                }
+                app.input.delete();
             }
             KeyCode::Left => {
-                app.input.cursor_pos = app.input.cursor_pos.saturating_sub(1);
+                app.input.move_left();
             }
             KeyCode::Right => {
-                if app.input.cursor_pos < app.input.buffer.len() {
-                    app.input.cursor_pos += 1;
-                }
+                app.input.move_right();
             }
-            KeyCode::Home => app.input.cursor_pos = 0,
-            KeyCode::End => app.input.cursor_pos = app.input.buffer.len(),
+            KeyCode::Home => app.input.move_cursor_home(),
+            KeyCode::End => app.input.move_cursor_end(),
             KeyCode::Up => {
                 if handle_picker_nav(app, -1) {
                     return Ok(());
@@ -949,16 +1053,14 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                 } else if app.input.buffer.contains('@') {
                     complete_mention(app);
                 } else {
-                    app.input.buffer.insert_str(app.input.cursor_pos, "  ");
-                    app.input.cursor_pos += 2;
+                    app.input.insert_str("  ");
                 }
             }
             KeyCode::Enter => {
                 // Shift+Enter = newline (needs kitty keyboard enhancement,
                 // pushed in main; plain terminals keep sending plain Enter).
                 if is_shift_enter(key) {
-                    app.input.buffer.insert(app.input.cursor_pos, '\n');
-                    app.input.cursor_pos += 1;
+                    app.input.insert_newline();
                     return Ok(());
                 }
                 // Bare `/xxx`: exact command runs, highlight completes;
@@ -983,32 +1085,20 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                     Some(BareEnter::Submit) | None => {}
                 }
                 let input = std::mem::take(&mut app.input.buffer);
-                app.input.cursor_pos = 0;
+                app.input.move_cursor_home();
                 app.input.history_index = None;
                 reset_picker(app);
-                if input.trim().is_empty() || app.event_rx.is_some() {
+                if input.trim().is_empty() {
                     return Ok(());
                 }
-                if input.trim_start().starts_with('/') {
-                    if handle_slash(app, input.trim())? {
-                        return Ok(());
-                    }
+                if app.event_rx.is_some() {
+                    // The agent is mid-run: keep the text. Sending it now would
+                    // interleave with the live turn, so it waits in the queue —
+                    // dropping it silently (what this used to do) lost work.
+                    queue_message(app, input);
+                    return Ok(());
                 }
-                // @file expansion (context attach)
-                let (expanded, missing) = expand_mentions(&input, &app.workspace.root);
-                if !missing.is_empty() {
-                    app.notice = Some(format!("@ not found: {}", missing.join(", ")));
-                }
-                app.input.push_history(input.clone());
-                app.conversation.add_message("user".into(), input);
-                // stash expanded for the agent without polluting transcript:
-                // temporarily push expanded as last message clone for LLM only
-                // -> implement by replacing last message content during start_agent
-                app.is_home = false;
-                app.save_session();
-                app.should_auto_scroll = true;
-                app.chat_scroll = 0;
-                start_agent_with_expanded(app, expanded);
+                submit_message(app, input)?;
             }
             KeyCode::Esc => {
                 if app.event_rx.is_some() {
@@ -1017,9 +1107,16 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                     app.save_session();
                     app.streaming_text.clear();
                     app.status.tool_status = "cancelled".into();
+                    // Cancelling means "stop", so don't fire queued messages
+                    // the moment the run unwinds.
+                    if !app.queued_input.is_empty() {
+                        let n = app.queued_input.len();
+                        app.queued_input.clear();
+                        app.notice = Some(format!("cancelled · {} queued dropped", n));
+                    }
                 } else if app.input.buffer.starts_with('/') {
                     app.input.buffer.clear();
-                    app.input.cursor_pos = 0;
+                    app.input.move_cursor_home();
                     reset_picker(app);
                 }
             }
@@ -1037,6 +1134,47 @@ pub fn handle_events(app: &mut App) -> Result<()> {
         }
     }
     return Ok(());
+}
+
+/// How many messages can wait behind a running agent turn.
+const MAX_QUEUED: usize = 8;
+
+/// Park a message typed mid-run. Oldest goes first when full — the alternative
+/// is refusing input, which is what made the busy state feel broken.
+fn queue_message(app: &mut App, text: String) {
+    if app.queued_input.len() >= MAX_QUEUED {
+        app.queued_input.remove(0);
+        app.notice = Some(format!("queue full ({}) — oldest dropped", MAX_QUEUED));
+    }
+    let n = app.queued_input.len() + 1;
+    app.queued_input.push(text);
+    if app.notice.is_none() {
+        app.notice = Some(format!("queued (#{} in line) — sends when the agent stops", n));
+    }
+}
+
+/// Run one message: slash command, or a full agent turn. Used both by `Enter`
+/// and by the queue drain in `app::handle_stream`.
+pub fn submit_message(app: &mut App, input: String) -> Result<()> {
+    if input.trim_start().starts_with('/') && handle_slash(app, input.trim())? {
+        return Ok(());
+    }
+    // @file expansion (context attach)
+    let (expanded, missing) = expand_mentions(&input, &app.workspace.root);
+    if !missing.is_empty() {
+        app.notice = Some(format!("@ not found: {}", missing.join(", ")));
+    }
+    app.input.push_history(input.clone());
+    app.conversation.add_message("user".into(), input);
+    // stash expanded for the agent without polluting transcript:
+    // temporarily push expanded as last message clone for LLM only
+    // -> implement by replacing last message content during start_agent
+    app.is_home = false;
+    app.save_session();
+    app.should_auto_scroll = true;
+    app.chat_scroll = 0;
+    start_agent_with_expanded(app, expanded);
+    Ok(())
 }
 
 fn start_agent_with_expanded(app: &mut App, expanded: String) {
@@ -1068,6 +1206,8 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
             app.should_auto_scroll = true;
             app.is_home = true;
             app.status.tool_status = "idle".into();
+            // Nothing of the old turn is in the window any more.
+            app.last_prompt_tokens = None;
             return Ok(true);
         }
         "/model" => {
@@ -1273,7 +1413,7 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
         }
         "/session" => {
             let info = format!(
-                "**Session:** `{}`\n- provider: `{}`\n- model: `{}`\n- key: {} ({})\n- msgs: {}\n- cwd: `{}`\n- ctx: ~{}%\n- auto-compact: {} (keep={})\n- theme: `{}`\n- tree: {}",
+                "**Session:** `{}`\n- provider: `{}`\n- model: `{}`\n- key: {} ({})\n- msgs: {}\n- cwd: `{}`\n- ctx: {}% of {}k window ({})\n- auto-compact: {} (keep={})\n- theme: `{}`\n- tree: {}",
                 app.session_id.as_deref().unwrap_or("(unsaved)"),
                 app.provider_name,
                 app.current_model,
@@ -1282,6 +1422,12 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
                 app.conversation.messages.len(),
                 app.workspace.root.display(),
                 (app.context_usage() * 100.0) as u32,
+                app.config.resolve_context_window() / 1000,
+                if app.context_is_estimated() {
+                    "estimated"
+                } else {
+                    "provider-reported"
+                },
                 app.config.resolve_auto_compact(),
                 app.config.resolve_compact_keep(),
                 app.theme.name,
@@ -1390,6 +1536,10 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
         }
         "/reload" => {
             app.workspace = crate::workspace::WorkspaceContext::new();
+            // The file tree just changed size, so the cached prompt overhead
+            // (and the provider's count for the previous one) are both stale.
+            app.last_prompt_tokens = None;
+            app.refresh_prompt_overhead_for_reload();
             app.notice = Some("workspace reloaded".into());
             app.is_home = false;
             return Ok(true);
@@ -1451,7 +1601,7 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
             return Ok(true);
         }
         "/hotkeys" => {
-            app.conversation.add_message("assistant".into(), "**Keys:**\n- `Enter` send · `Shift+Enter/Ctrl+J` newline\n- `Tab` complete `/` or `@` · `Up/Down` palette/history\n- `Ctrl+C` clear/quit · `Ctrl+D` quit · `Ctrl+U/K/W` edit · `Ctrl+A/E` jump\n- `Ctrl+O` expand tools · `Ctrl+T` tree panel · `Esc` cancel · `PgUp/PgDn` or wheel scroll\n- approval modal: `y` once · `a` always · `n`/`Esc` deny".into());
+            app.conversation.add_message("assistant".into(), "**Keys:**\n- `Enter` send (queues while the agent works) · `Shift+Enter/Ctrl+J` newline\n- `Tab` complete `/` or `@` · `Up/Down` palette/history\n- `Ctrl+C` clear/quit · `Ctrl+D` quit · `Ctrl+U/K/W` edit · `Ctrl+A/E` jump\n- `Ctrl+O` expand tools · `Ctrl+T` tree panel · `Esc` cancel · `PgUp/PgDn` or wheel scroll\n- approval modal: `y` once · `a` always · `n`/`Esc` deny".into());
             app.save_session();
             app.is_home = false;
             return Ok(true);
@@ -1645,8 +1795,7 @@ mod tests {
     }
 
     #[test]
-    fn input_footer_shows_provider_model() {
-        use ratatui::{backend::TestBackend, Terminal};
+    fn input_footer_shows_provider_model() {        use ratatui::{backend::TestBackend, Terminal};
         let mut app = test_app();
         // Type an @mention so chips render too.
         app.input.buffer = "read @src/main.rs".into();
@@ -1670,6 +1819,627 @@ mod tests {
         assert!(pad.trim().is_empty(), "pad row: {:?}", pad);
         let first: String = (0..80).map(|x| buf[(x, 20)].symbol().to_string()).collect();
         assert!(first.contains("read @src/main.rs"), "content row: {}", first);
+    }
+
+    /// Full interactive audit through a headless terminal: picker opens for
+    /// every mode, highlight moves with navigation, Enter applies it.
+    /// This is the closest we get to clicking through the TUI in CI.
+    fn draw_cells(app: &mut App, w: u16, h: u16) -> Vec<Vec<ratatui::buffer::Cell>> {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].clone()).collect::<Vec<_>>())
+            .collect()
+    }
+
+    /// Text rows (y) containing a highlighted (accent-bg) cell.
+    fn accent_rows(rows: &[Vec<ratatui::buffer::Cell>], accent: ratatui::style::Color) -> Vec<usize> {
+        rows.iter()
+            .enumerate()
+            .filter(|(_, r)| r.iter().any(|c| c.bg == accent))
+            .map(|(y, _)| y)
+            .collect()
+    }
+
+    /// One drawn row as plain text.
+    fn row_text(rows: &[Vec<ratatui::buffer::Cell>], y: usize) -> String {
+        rows[y].iter().map(|c| c.symbol().to_string()).collect()
+    }
+
+    /// The chat viewport only (chat is 0..h-5: input 3 + footer 1 + status 1).
+    fn chat_rows(rows: &[Vec<ratatui::buffer::Cell>], h: u16) -> Vec<String> {
+        (0..h as usize - 5).map(|y| row_text(rows, y)).collect()
+    }
+
+    /// A transcript whose every paragraph wraps: the case where counting
+    /// logical lines used to leave the newest text off-screen.
+    fn wrapping_convo(n: usize) -> Vec<String> {
+        (0..n)
+            .map(|i| {
+                format!(
+                    "Jawaban nomor {} yang cukup panjang untuk membuat baris membungkus di terminal eighty dua kolom lebarnya.\n- detail satu\n- detail dua",
+                    i
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tail_stays_visible_while_following() {
+        let mut app = test_app();
+        app.is_home = false;
+        for body in wrapping_convo(6) {
+            app.conversation.add_message("assistant".into(), body);
+        }
+        let rows = draw_cells(&mut app, 82, 22);
+        let chat = chat_rows(&rows, 22);
+        let joined = chat.join("\n");
+        assert!(
+            joined.contains("nomor 5"),
+            "newest answer must be on screen while following:\n{}",
+            joined
+        );
+        assert!(
+            joined.contains("- detail dua"),
+            "tail of the newest answer must be on screen:\n{}",
+            joined
+        );
+        assert!(app.should_auto_scroll, "follow mode stays on");
+    }
+
+    #[test]
+    fn tail_stays_visible_after_resize() {
+        let mut app = test_app();
+        app.is_home = false;
+        for body in wrapping_convo(4) {
+            app.conversation.add_message("assistant".into(), body);
+        }
+        // Shrink the terminal: the follow position must be recomputed, not kept.
+        let _ = draw_cells(&mut app, 82, 30);
+        let rows = draw_cells(&mut app, 46, 14);
+        let joined = chat_rows(&rows, 14).join("\n");
+        assert!(joined.contains("nomor 3"), "after resize:\n{}", joined);
+    }
+
+    #[test]
+    fn pgup_pgdn_move_physical_rows() {
+        let mut app = test_app();
+        app.is_home = false;
+        for body in wrapping_convo(6) {
+            app.conversation.add_message("assistant".into(), body);
+        }
+        let rows = draw_cells(&mut app, 82, 22);
+        let bottom = chat_rows(&rows, 22);
+        // Jump to the top the way the wheel/PageUp arm does.
+        app.chat_scroll = 0;
+        app.should_auto_scroll = false;
+        let rows = draw_cells(&mut app, 82, 22);
+        let top = chat_rows(&rows, 22);
+        assert!(!top.join("\n").contains("nomor 5"), "scrolled up:\n{}", top.join("\n"));
+        // One PageDown = 10 rows, in physical rows this time: the rows that
+        // were at the bottom edge move to the top edge, nothing more.
+        app.chat_scroll += 10;
+        app.should_auto_scroll = false;
+        let rows = draw_cells(&mut app, 82, 22);
+        let after = chat_rows(&rows, 22);
+        let shifted: Vec<String> = top.iter().skip(10).cloned().collect();
+        assert_eq!(
+            after.iter().take(shifted.len()).cloned().collect::<Vec<_>>(),
+            shifted,
+            "PageDown must shift the view by exactly 10 rows"
+        );
+        // Scrolling back to the bottom resumes following.
+        app.chat_scroll = usize::MAX;
+        let _ = draw_cells(&mut app, 82, 22);
+        let rows = draw_cells(&mut app, 82, 22);
+        assert!(app.should_auto_scroll, "bottom → follow again");
+        assert_eq!(chat_rows(&rows, 22), bottom, "and shows the same tail");
+    }
+
+    #[test]
+    fn scrolling_up_survives_new_content() {
+        let mut app = test_app();
+        app.is_home = false;
+        for body in wrapping_convo(4) {
+            app.conversation.add_message("assistant".into(), body);
+        }
+        let _ = draw_cells(&mut app, 82, 22);
+        app.chat_scroll = 0;
+        app.should_auto_scroll = false;
+        let held = app.chat_scroll;
+        // Streaming while the user reads history must not yank the view down.
+        for body in wrapping_convo(3) {
+            app.conversation.add_message("assistant".into(), body);
+        }
+        let _ = draw_cells(&mut app, 82, 22);
+        assert!(!app.should_auto_scroll, "still reading history");
+        assert_eq!(app.chat_scroll, held, "scroll position kept");
+    }
+
+    #[test]
+    fn short_transcript_needs_no_scroll() {
+        let mut app = test_app();
+        app.is_home = false;
+        app.conversation.add_message("assistant".into(), "hi".into());
+        let rows = draw_cells(&mut app, 40, 10);
+        assert_eq!(app.chat_scroll, 0);
+        assert!(chat_rows(&rows, 10).join("\n").contains("hi"));
+    }
+
+    // --- busy state: the draft stays visible and Enter queues it ---
+
+    /// An app with a live agent turn (event_rx set, never yields a Done).
+    fn busy_app() -> App {
+        let mut app = test_app();
+        app.is_home = false;
+        app.conversation.add_message("assistant".into(), "working on it".into());
+        let (_tx, rx) = tokio::sync::mpsc::channel(8);
+        app.event_rx = Some(rx);
+        app.status.tool_status = "processing...".into();
+        app
+    }
+
+    /// The Enter arm, minus the parts that need a real terminal: takes the
+    /// buffer and routes it exactly like `handle_events` does.
+    fn press_enter(app: &mut App) {
+        let input = std::mem::take(&mut app.input.buffer);
+        app.input.move_cursor_home();
+        app.input.history_index = None;
+        reset_picker(app);
+        if input.trim().is_empty() {
+            return;
+        }
+        if app.event_rx.is_some() {
+            super::queue_message(app, input);
+            return;
+        }
+        super::submit_message(app, input).unwrap();
+    }
+
+    #[test]
+    fn busy_input_shows_the_draft_not_just_a_label() {
+        let mut app = busy_app();
+        app.input.buffer = "draft while busy".into();
+        app.input.set_cursor(app.input.buffer.len());
+        let rows = draw_cells(&mut app, 60, 16);
+        let panel: Vec<String> = (11..15).map(|y| row_text(&rows, y)).collect();
+        let joined = panel.join("\n");
+        assert!(joined.contains("draft while busy"), "draft must be visible:\n{}", joined);
+        assert!(joined.contains('\u{2588}'), "cursor must be visible:\n{}", joined);
+        assert!(joined.contains("Esc to cancel"), "hint must stay:\n{}", joined);
+    }
+
+    #[test]
+    fn enter_while_busy_queues_instead_of_discarding() {
+        let mut app = busy_app();
+        app.input.buffer = "pertanyaan kedua".into();
+        app.input.set_cursor(app.input.buffer.len());
+        press_enter(&mut app);
+        assert_eq!(app.queued_input, vec!["pertanyaan kedua".to_string()]);
+        assert!(app.input.buffer.is_empty(), "draft moves into the queue");
+        // Nothing was sent to the model yet.
+        assert_eq!(app.conversation.messages.len(), 1);
+        assert_eq!(app.status.tool_status, "processing...", "run untouched");
+    }
+
+    #[test]
+    fn queue_drains_in_order_when_the_run_ends() {
+        let mut app = busy_app();
+        for text in ["satu", "dua", "tiga"] {
+            app.input.buffer = text.into();
+            app.input.set_cursor(app.input.buffer.len());
+            press_enter(&mut app);
+        }
+        assert_eq!(app.queued_input.len(), 3);
+        // Finish the run the way `Done` does, then let the drain fire.
+        app.event_rx = None;
+        app.status.tool_status = "idle".into();
+        app.drain_queued_input();
+        let sent: Vec<String> = app
+            .conversation
+            .messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .map(|m| m.content.clone().unwrap_or_default())
+            .collect();
+        // One turn per drain; this fixture has no API key so the turn aborts
+        // immediately and the rest wait for the next drain.
+        assert_eq!(sent, vec!["satu".to_string()], "FIFO order");
+        assert_eq!(app.queued_input, vec!["dua".to_string(), "tiga".to_string()]);
+    }
+
+    #[test]
+    fn queue_is_bounded() {
+        let mut app = busy_app();
+        for i in 0..(super::MAX_QUEUED + 3) {
+            app.input.buffer = format!("m{i}");
+            app.input.set_cursor(app.input.buffer.len());
+            press_enter(&mut app);
+        }
+        assert_eq!(app.queued_input.len(), super::MAX_QUEUED);
+        assert_eq!(app.queued_input.last().unwrap(), "m10", "newest kept");
+        assert_eq!(app.queued_input.first().unwrap(), "m3", "oldest dropped");
+    }
+
+    #[test]
+    fn failed_turn_does_not_stall_the_queue() {
+        // No API key in this fixture, so every queued turn refuses to start.
+        // The drain must still empty the queue instead of wedging on the first.
+        let mut app = busy_app();
+        for text in ["satu", "dua", "tiga"] {
+            app.input.buffer = text.into();
+            app.input.set_cursor(app.input.buffer.len());
+            press_enter(&mut app);
+        }
+        let (_tx, rx) = tokio::sync::mpsc::channel(8);
+        app.event_rx = Some(rx);
+        app.handle_stream().unwrap();
+        app.event_rx = None;
+        // One "run finished" tick.
+        app.drain_queued_input();
+        let mut budget = app.queued_input.len();
+        while budget > 0 && app.event_rx.is_none() && !app.queued_input.is_empty() {
+            budget -= 1;
+            app.drain_queued_input();
+        }
+        assert!(app.queued_input.is_empty(), "queue must not wedge");
+        let sent: Vec<String> = app
+            .conversation
+            .messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .map(|m| m.content.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(sent, vec!["satu", "dua", "tiga"], "all sent, in order");
+    }
+
+    #[test]
+    fn cancel_drops_the_queue() {
+        let mut app = busy_app();
+        app.input.buffer = "never sent".into();
+        app.input.set_cursor(app.input.buffer.len());
+        press_enter(&mut app);
+        assert_eq!(app.queued_input.len(), 1);
+        // Esc cancels the run and must not let the queue fire afterwards.
+        app.cancelled.store(true, Ordering::Relaxed);
+        app.event_rx = None;
+        app.queued_input.clear();
+        app.drain_queued_input();
+        assert!(app.queued_input.is_empty());
+        assert_eq!(app.conversation.messages.len(), 1, "no user message was sent");
+    }
+
+    #[test]
+    fn footer_shows_queue_depth() {
+        let mut app = busy_app();
+        app.queued_input = vec!["a".into(), "b".into()];
+        let rows = draw_cells(&mut app, 80, 16);
+        assert!(row_text(&rows, 14).contains("2 queued"), "footer: {}", row_text(&rows, 14));
+    }
+
+    // --- input panel: the cursor stays visible on a long wrapped line ---
+
+    #[test]
+    fn cursor_stays_visible_on_a_long_single_line() {
+        let mut app = test_app();
+        app.input.buffer = "q".repeat(200);
+        app.input.set_cursor(app.input.buffer.len());
+        let rows = draw_cells(&mut app, 40, 24);
+        let panel: Vec<String> = (19..22).map(|y| row_text(&rows, y)).collect();
+        assert!(
+            panel.iter().any(|l| l.contains('\u{2588}')),
+            "block cursor must be inside the 3-row panel:\n{}",
+            panel.join("\n")
+        );
+    }
+
+    #[test]
+    fn cursor_visible_at_every_column_of_a_wrapped_line() {
+        // Width 40 → inner 39. Sweep the cursor across wrap boundaries.
+        for cursor in [0usize, 1, 38, 39, 40, 77, 78, 79, 120, 200] {
+            let mut app = test_app();
+            app.input.buffer = "q".repeat(200);
+            app.input.set_cursor(cursor);
+            let rows = draw_cells(&mut app, 40, 24);
+            let panel: Vec<String> = (19..22).map(|y| row_text(&rows, y)).collect();
+            assert!(
+                panel.iter().any(|l| l.contains('\u{2588}')),
+                "cursor at {} not rendered:\n{}",
+                cursor,
+                panel.join("\n")
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_visible_in_a_tall_multiline_draft() {
+        let mut app = test_app();
+        app.input.buffer = "satu\ndua\ntiga\nempat\nlima\nenam\ntujuh".into();
+        app.input.set_cursor(app.input.buffer.len());
+        let rows = draw_cells(&mut app, 40, 24);
+        let panel: Vec<String> = (19..22).map(|y| row_text(&rows, y)).collect();
+        let joined = panel.join("\n");
+        assert!(joined.contains('\u{2588}'), "cursor must show:\n{}", joined);
+        assert!(joined.contains("tujuh"), "and the text it sits on:\n{}", joined);
+    }
+
+    // --- approval modal: the payload must be reviewable ---
+
+    fn approve(name: &str, args: serde_json::Value) -> App {
+        let mut app = test_app();
+        app.is_home = false;
+        app.conversation.add_message("assistant".into(), "working".into());
+        app.pending_approval = Some(crate::agent::permissions::PendingTool {
+            id: "1".into(),
+            name: name.into(),
+            args,
+        });
+        app
+    }
+
+    /// Rows inside the modal's rounded border.
+    fn modal_rows(rows: &[Vec<ratatui::buffer::Cell>], h: u16) -> Vec<String> {
+        let top = (0..h as usize).find(|&y| row_text(rows, y).contains('╭'));
+        let bottom = (0..h as usize).find(|&y| row_text(rows, y).contains('╰'));
+        match (top, bottom) {
+            (Some(t), Some(b)) => (t..=b).map(|y| row_text(rows, y)).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn modal_shows_the_whole_bash_command() {
+        let cmd = "cargo test --all-features && rm -rf build && git commit -am 'a fairly long commit message here'";
+        let mut app = approve("bash", serde_json::json!({ "command": cmd }));
+        let rows = draw_cells(&mut app, 100, 24);
+        let modal = modal_rows(&rows, 24);
+        let joined = modal.join("\n");
+        assert!(!modal.is_empty(), "modal must render");
+        assert!(!joined.contains("{\"command\""), "raw JSON must be gone:\n{}", joined);
+        // Every word of the command has to be on screen somewhere.
+        for word in cmd.split_whitespace() {
+            let needle: String = word.chars().take(6).collect();
+            assert!(joined.contains(&needle), "missing {:?} in:\n{}", word, joined);
+        }
+        assert!(joined.contains('y') && joined.contains("once"), "keys must show");
+        assert!(joined.contains("always") && joined.contains("deny"));
+    }
+
+    #[test]
+    fn modal_write_shows_path_and_content() {
+        let app = approve(
+            "write",
+            serde_json::json!({ "path": "src/main.rs", "content": "fn main() {\n    println!(\"hi\");\n}\n" }),
+        );
+        let mut app = app;
+        let rows = draw_cells(&mut app, 100, 24);
+        let joined = modal_rows(&rows, 24).join("\n");
+        assert!(joined.contains("src/main.rs"), "path:\n{}", joined);
+        assert!(joined.contains("fn main()"), "content:\n{}", joined);
+        assert!(joined.contains("3 lines"), "line count:\n{}", joined);
+        assert!(!joined.contains("\"content\""), "no raw JSON");
+    }
+
+    #[test]
+    fn modal_edit_reads_as_a_diff() {
+        let mut app = approve(
+            "edit",
+            serde_json::json!({
+                "path": "src/app.rs",
+                "old_string": "let ctx = 0;",
+                "new_string": "let ctx = compute_context();",
+            }),
+        );
+        let rows = draw_cells(&mut app, 100, 24);
+        let joined = modal_rows(&rows, 24).join("\n");
+        assert!(joined.contains("src/app.rs"), "path:\n{}", joined);
+        assert!(joined.contains("- let ctx = 0;"), "removed line:\n{}", joined);
+        assert!(joined.contains("+ let ctx = compute_context();"), "added line:\n{}", joined);
+    }
+
+    #[test]
+    fn modal_caps_huge_payload_and_says_so() {
+        let big: String = (0..500).map(|i| format!("line {i}\n")).collect();
+        let mut app = approve("write", serde_json::json!({ "path": "big.rs", "content": big }));
+        let rows = draw_cells(&mut app, 100, 24);
+        let modal = modal_rows(&rows, 24);
+        let joined = modal.join("\n");
+        assert!(joined.contains("writes 500 lines"), "total:\n{}", joined);
+        assert!(joined.contains("more lines"), "must admit the truncation:\n{}", joined);
+        assert!(modal.len() <= 24, "modal must fit the terminal, got {}", modal.len());
+    }
+
+    #[test]
+    fn modal_fits_a_narrow_terminal() {
+        let cmd = "echo a-very-long-single-token-that-cannot-wrap-anywhere-at-all && echo short";
+        let mut app = approve("bash", serde_json::json!({ "command": cmd }));
+        let rows = draw_cells(&mut app, 40, 16);
+        let modal = modal_rows(&rows, 16);
+        assert!(!modal.is_empty(), "modal must render at 40 cols");
+        for row in &modal {
+            assert!(
+                row.chars().count() <= 40,
+                "row overflows 40 cols ({}): {:?}",
+                row.chars().count(),
+                row
+            );
+        }
+        assert!(modal.join("\n").contains("deny"), "keys must survive");
+    }
+
+    #[test]
+    fn modal_has_no_blank_rows_inside() {
+        // The old modal was a fixed 9 rows with three of them empty.
+        let mut app = approve("bash", serde_json::json!({ "command": "ls" }));
+        let rows = draw_cells(&mut app, 100, 24);
+        let modal = modal_rows(&rows, 24);
+        assert_eq!(modal.len(), 6, "border+name+cmd+blank+keys+border: {:?}", modal);
+    }
+
+    #[test]
+    fn modal_falls_back_to_key_values_for_unknown_tools() {
+        let mut app = approve(
+            "delegate",
+            serde_json::json!({ "task": "review the diff carefully" }),
+        );
+        let rows = draw_cells(&mut app, 100, 24);
+        let joined = modal_rows(&rows, 24).join("\n");
+        assert!(joined.contains("task"), "key shown:\n{}", joined);
+        assert!(joined.contains("review the diff carefully"), "value shown:\n{}", joined);
+    }
+
+    // --- picker geometry: it must fit above the input and stay readable ---
+
+    /// Rows occupied by the picker's border box (0 = not open).
+    fn picker_span(rows: &[Vec<ratatui::buffer::Cell>], h: u16) -> Option<(usize, usize)> {
+        let top = (0..h as usize).find(|&y| row_text(rows, y).contains('╭'))?;
+        let bottom = (0..h as usize).find(|&y| row_text(rows, y).contains('╰'))?;
+        Some((top, bottom))
+    }
+
+    #[test]
+    fn picker_never_covers_the_input() {
+        // Small terminals used to get a 10-row picker pasted over the input box.
+        for (w, h) in [(20u16, 10u16), (24, 12), (40, 9), (60, 8), (80, 24)] {
+            let mut app = test_app();
+            app.input.buffer = "/model ".into();
+            app.input.set_cursor(app.input.buffer.len());
+            let rows = draw_cells(&mut app, w, h);
+            let input_top = h as usize - 5;
+            match picker_span(&rows, h) {
+                None => panic!("picker must open at {}x{}", w, h),
+                Some((_, bottom)) => assert!(
+                    bottom < input_top,
+                    "picker bottom {} overlaps the input (top {}) at {}x{}",
+                    bottom,
+                    input_top,
+                    w,
+                    h
+                ),
+            }
+            // The input row keeps its own content.
+            let first = row_text(&rows, input_top + 1);
+            assert!(
+                first.contains("/model"),
+                "input must still show the draft at {}x{}: {:?}",
+                w,
+                h,
+                first
+            );
+        }
+    }
+
+    #[test]
+    fn picker_items_never_wrap_to_two_rows() {
+        // A too-wide cell used to wrap, doubling every entry and pushing the
+        // list off the box.
+        for (w, h) in [(20u16, 10u16), (26, 14), (40, 20), (100, 24)] {
+            let mut app = test_app();
+            app.input.buffer = "/login ".into();
+            app.input.set_cursor(app.input.buffer.len());
+            let rows = draw_cells(&mut app, w, h);
+            let (top, bottom) = picker_span(&rows, h).expect("picker opens");
+            let item_rows = (top + 1)..bottom;
+            assert!(!item_rows.is_empty(), "{}x{}: no items", w, h);
+            for y in item_rows.clone() {
+                let line = row_text(&rows, y);
+                assert!(
+                    !line.trim().is_empty(),
+                    "blank item row at {}x{} — an entry wrapped:\n{}",
+                    w,
+                    h,
+                    (top..=bottom).map(|r| row_text(&rows, r)).collect::<Vec<_>>().join("\n")
+                );
+                assert!(
+                    line.chars().take_while(|c| *c == ' ').count() < 3,
+                    "wrapped continuation at {}x{}: {:?}",
+                    w,
+                    h,
+                    line
+                );
+            }
+            // One highlighted row per item, no more.
+            let accent = app.theme.accent;
+            let highlighted = (top..=bottom)
+                .filter(|y| rows[*y].iter().any(|c| c.bg == accent))
+                .count();
+            assert_eq!(highlighted, 1, "{}x{}: exactly one highlight", w, h);
+        }
+    }
+
+    #[test]
+    fn picker_label_readable_on_light_background() {
+        let mut app = test_app();
+        app.set_theme("light");
+        app.input.buffer = "/login ".into();
+        app.input.set_cursor(app.input.buffer.len());
+        let w = 80u16;
+        let h = 24u16;
+        let rows = draw_cells(&mut app, w, h);
+        let (top, bottom) = picker_span(&rows, h).expect("picker opens");
+        // Non-selected label cells must not be hardcoded white.
+        let mut checked = 0;
+        for row in rows.iter().take(bottom).skip(top + 1) {
+            for cell in row {
+                let sym = cell.symbol();
+                if sym.chars().next().is_some_and(|c| c.is_ascii_alphanumeric()) {
+                    assert_ne!(
+                        cell.fg,
+                        ratatui::style::Color::White,
+                        "white text on a light terminal in row {:?}",
+                        row_text(&rows, top + 1)
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 5, "expected to inspect label cells, saw {}", checked);
+    }
+
+    #[test]
+    fn audit_every_picker_opens() {
+        // "/resume " has no rows without saved sessions — correct, nothing to pick.
+        for buffer in ["/", "/model ", "/login ", "/theme ", "/approve "] {
+            let mut app = test_app();
+            app.input.buffer = buffer.into();
+            app.input.cursor_pos = app.input.buffer.len();
+            let rows = draw_cells(&mut app, 80, 24);
+            let accent = app.theme.accent;
+            assert_eq!(
+                accent_rows(&rows, accent).len(),
+                1,
+                "exactly one highlighted row for {:?}",
+                buffer
+            );
+        }
+    }
+
+    #[test]
+    fn audit_navigate_then_enter_applies_highlight() {
+        let mut app = test_app();
+        app.auth.set("nvidia", "nvapi-test-key");
+        app.input.buffer = "/model ".into();
+        app.input.cursor_pos = app.input.buffer.len();
+        // Arrow down twice, exactly like the Up/Down arm does.
+        assert!(super::handle_picker_nav(&mut app, 1));
+        assert!(super::handle_picker_nav(&mut app, 1));
+        // The highlighted row must be the 3rd model entry.
+        let rows = draw_cells(&mut app, 100, 30);
+        let accent = app.theme.accent;
+        let sel = accent_rows(&rows, accent);
+        assert_eq!(sel.len(), 1);
+        let text: String = rows[sel[0]].iter().map(|c| c.symbol().to_string()).collect();
+        let entries = model_entries(&app, "");
+        let (ep, em, _) = entries[2].clone();
+        assert!(text.contains(&ep), "highlight shows 3rd entry, got: {}", text);
+        // Enter: replicate the Enter arm 1:1 (take buffer, submit to slash).
+        let input = std::mem::take(&mut app.input.buffer);
+        app.input.cursor_pos = 0;
+        super::handle_slash(&mut app, input.trim()).unwrap();
+        assert_eq!(app.provider_name, ep);
+        assert_eq!(app.current_model, em);
     }
 
     #[test]
@@ -1876,4 +2646,115 @@ mod tests {
         handle_slash(&mut app, "/model nvid").unwrap();
         assert_eq!(app.provider_name, "nvidia", "highlighted entry must win");
     }
+
+    // --- multibyte input: cursor_pos is a byte offset, never a char count ---
+
+    #[test]
+    fn cursor_clamps_and_snaps_to_boundary() {
+        let mut inp = InputState::new();
+        inp.buffer = "é".into();
+        inp.cursor_pos = 99;
+        assert_eq!(inp.cursor(), 2, "past the end clamps to len");
+        inp.cursor_pos = 1;
+        assert_eq!(inp.cursor(), 0, "mid-char snaps down");
+        inp.cursor_pos = 2;
+        assert_eq!(inp.cursor(), 2, "already a boundary: unchanged");
+    }
+
+    #[test]
+    fn multibyte_typing_and_deleting() {
+        let mut inp = InputState::new();
+        for c in "café".chars() {
+            inp.insert_char(c);
+        }
+        assert_eq!(inp.buffer, "café");
+        assert_eq!(inp.cursor(), 5, "byte offset, not char count");
+        inp.insert_char('!');
+        assert_eq!(inp.buffer, "café!");
+        inp.backspace();
+        assert_eq!(inp.buffer, "café");
+        assert_eq!(inp.cursor(), 5);
+        // One Left crosses the whole 2-byte char, never a half-byte.
+        inp.move_left();
+        assert_eq!(inp.cursor(), 3);
+        assert!(inp.buffer.is_char_boundary(inp.cursor()));
+        inp.move_right();
+        assert_eq!(inp.cursor(), 5);
+        assert_eq!(inp.cursor(), inp.buffer.len());
+    }
+
+    #[test]
+    fn multibyte_kill_commands() {
+        let mut inp = InputState::new();
+        inp.buffer = "αβγ delta".into();
+        inp.set_cursor(inp.buffer.len());
+        inp.delete_word_before();
+        assert_eq!(inp.buffer, "αβγ ");
+        inp.move_cursor_end();
+        inp.backspace();
+        assert_eq!(inp.buffer, "αβγ");
+        inp.set_cursor(2);
+        inp.delete();
+        assert_eq!(inp.buffer, "αγ", "Delete eats the char under the cursor");
+        inp.set_cursor(4);
+        inp.delete_before_cursor();
+        assert_eq!(inp.buffer, "", "Ctrl+U drops everything before the cursor");
+        inp.buffer = "αβγ".into();
+        inp.set_cursor(2);
+        inp.delete_to_cursor();
+        assert_eq!(inp.buffer, "α", "Ctrl+K drops from the cursor on");
+        inp.move_cursor_home();
+        inp.delete();
+        assert_eq!(inp.buffer, "", "Delete at offset 0 eats the first char");
+        inp.move_cursor_end();
+        inp.delete();
+        assert_eq!(inp.buffer, "", "Delete at the end is a no-op");
+    }
+
+    #[test]
+    fn multibyte_word_jump() {
+        let mut inp = InputState::new();
+        inp.buffer = "αβγ δεζ".into();
+        inp.set_cursor(inp.buffer.len());
+        assert_eq!(inp.word_start_before(), 7, "start of δεζ (byte 7)");
+        assert_eq!(inp.word_end_after(), inp.buffer.len());
+        inp.set_cursor(6);
+        assert_eq!(inp.word_start_before(), 0);
+        assert_eq!(inp.word_end_after(), 7);
+    }
+
+    #[test]
+    fn multibyte_buffer_renders_cursor_without_panic() {
+        let mut app = test_app();
+        // The exact state the old char-index arithmetic produced after typing
+        // "café": 4 chars typed, 5 bytes. Rendering used to panic here.
+        app.input.buffer = "caf\u{e9}plain".into();
+        app.input.cursor_pos = 4;
+        let rows = draw_cells(&mut app, 60, 24);
+        let line: String = rows[20].iter().map(|c| c.symbol().to_string()).collect();
+        assert!(line.contains("caf"), "got: {}", line);
+        assert!(
+            line.contains('\u{2588}'),
+            "block cursor must render, got: {}",
+            line
+        );
+    }
+
+    #[test]
+    fn mention_expansion_truncates_multibyte_file() {
+        // Byte 8000 lands inside the 2-byte 'é' -> a fixed [&..8000] panicked.
+        let dir = std::env::temp_dir().join(format!("barong-mb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut big = "a".repeat(7999);
+        big.push('é');
+        big.push_str(&"b".repeat(200));
+        std::fs::write(dir.join("big.txt"), &big).unwrap();
+        let (out, missing) = expand_mentions("@big.txt", &dir);
+        assert!(missing.is_empty(), "missing: {:?}", missing);
+        assert!(out.contains("[truncated]"), "must cap the file");
+        assert!(out.contains("aaa"), "must keep the head");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
+
+

@@ -19,4 +19,12 @@ futures = "0.3"
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 unicode-width = "0.2"
+unicode-segmentation = "1"
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+
+[dev-dependencies]
+# `Paragraph::line_count` is the exact wrapped-row count, but it sits behind
+# ratatui's `unstable-rendered-line-info` feature. Enabling it for tests only
+# gives `src/tui/wrap.rs` an oracle to check its own row math against; the
+# shipped build stays on stable APIs.
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }

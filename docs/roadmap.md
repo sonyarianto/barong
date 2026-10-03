@@ -33,7 +33,7 @@
 - [x] System prompt for coding tasks
 - [x] Iteration limit and safety guardrails
 - [x] Interrupt/cancel mid-execution
-- [ ] Token usage tracking
+- [x] Token usage tracking (provider-reported prompt tokens drive the `ctx` gauge)
 
 ## Phase 5: Workspace Intelligence
 - [x] File tree panel (`/tree`, Ctrl+T)
@@ -55,8 +55,9 @@
 - [x] Auto-compact at 85% ctx, theme system, session branching
 
 ## Backlog (honest gaps)
-- [ ] Token usage tracking vs real model limits
+- [ ] Per-model context windows (today: one `context_window` setting, default 128k)
 - [ ] Agent-loop integration test with mock provider
 - [ ] Copy-code button on code blocks (pi has `[Copy]`)
-- [ ] Diff preview for edit/write approvals (modal shows raw JSON today)
+- [ ] Real unified diff for edit/write approvals (modal now shows per-tool
+  `+`/`-` payloads; still not a computed diff)
 - [ ] Retry with backoff on transient LLM errors

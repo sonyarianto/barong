@@ -8,6 +8,7 @@ pub mod session;
 pub mod mcp;
 pub mod cli;
 pub mod headless;
+pub mod text;
 
 use anyhow::Result;
 use clap::Parser;

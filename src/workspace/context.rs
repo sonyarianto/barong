@@ -26,10 +26,13 @@ pub fn load_agents_md(root: &std::path::Path) -> Option<String> {
                 continue;
             }
             // cap ~4000 chars to protect context window
-            let capped = if trimmed.len() > 4000 {
-                format!("{}…\n[truncated {} chars]", &trimmed[..4000], trimmed.len() - 4000)
-            } else {
-                trimmed
+            let capped = match crate::text::truncate_bytes(&trimmed, 4000) {
+                Some(head) => format!(
+                    "{}…\n[truncated {} chars]",
+                    head,
+                    trimmed.len() - head.len()
+                ),
+                None => trimmed,
             };
             return Some(capped);
         }

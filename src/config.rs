@@ -2,6 +2,9 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
 
+/// Assumed context window when the model/config doesn't say otherwise.
+pub const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ProviderConfig {
     /// API flavor: "openai" (default, chat completions) or "anthropic".
@@ -21,6 +24,9 @@ pub struct Config {
     pub api_key: Option<String>,
     pub base_url: Option<String>,
     pub max_tokens: Option<u32>,
+    /// Context window of the active model, in tokens. Drives the `ctx:%` gauge
+    /// and auto-compact; the default is a conservative 128k.
+    pub context_window: Option<usize>,
     pub theme: Option<String>,
     pub auto_approve: Option<bool>,
     pub auto_compact: Option<bool>,
@@ -235,6 +241,15 @@ impl Config {
         self.max_tokens.unwrap_or(4096)
     }
 
+    /// Context window in tokens for the active model. Guessing 128k for a 1M
+    /// model hides real pressure; guessing it for a 32k model invents it.
+    pub fn resolve_context_window(&self) -> usize {
+        self.context_window
+            .filter(|w| *w >= 1024)
+            .unwrap_or(DEFAULT_CONTEXT_WINDOW)
+            .max(1024)
+    }
+
     pub fn resolve_auto_approve(&self) -> bool {
         if let Some(v) = self.auto_approve {
             return v;
@@ -305,8 +320,13 @@ impl Config {
 mod tests {
     use super::*;
 
+    /// Env vars are process-global: serialize every test that reads or
+    /// writes them so parallel runs can't observe mid-swap values.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_resolve_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let cfg = Config::default();
         assert_eq!(cfg.resolve_provider(), "openai");
         assert_eq!(cfg.resolve_base_url(), "https://api.openai.com/v1");
@@ -316,7 +336,8 @@ mod tests {
 
     #[test]
     fn test_extra_tools_env() {
-        // SAFETY: unique var name, restored below; no other test reads it mid-flight.
+        let _guard = ENV_LOCK.lock().unwrap();
+        // SAFETY: guarded by ENV_LOCK; restored below.
         unsafe { std::env::set_var("BARONG_EXTRA_TOOLS", "grep,glob"); }
         let cfg = Config::default();
         let extras = cfg.resolve_extra_tools();
@@ -364,6 +385,36 @@ mod tests {
         assert_eq!(c.base_url, "https://proxy.local/v1");
         assert_eq!(c.models, vec!["custom-r1".to_string()]);
         assert!(custom.all_provider_ids().contains(&"deepseek".to_string()));
+    }
+    #[test]
+    fn jsonc_tolerates_comments_and_trailing_commas() {
+        let raw = r#"{
+  // the window of the model in use
+  "context_window": 200000, /* inline */
+  "theme": "dark",
+}"#;
+        let cleaned = strip_jsonc_comments(raw);
+        let cfg: Config = serde_json::from_str(&cleaned).expect("must parse");
+        assert_eq!(cfg.context_window, Some(200_000));
+        assert_eq!(cfg.theme.as_deref(), Some("dark"));
+    }
+
+    #[test]
+    fn trailing_comma_stripper_respects_strings() {
+        // A comma inside a string value must survive.
+        let raw = r#"{ "note": "a, b}", "n": 1 }"#;
+        let cleaned = strip_jsonc_comments(raw);
+        let cfg: Config = serde_json::from_str(&cleaned).expect("must parse");
+        assert_eq!(cfg.extra_tools.len(), 0);
+        assert!(cleaned.contains("a, b"), "got {}", cleaned);
+    }
+
+    #[test]
+    fn context_window_ignores_nonsense() {
+        let cfg: Config = serde_json::from_str(r#"{ "context_window": 12 }"#).expect("must parse");
+        assert_eq!(cfg.resolve_context_window(), DEFAULT_CONTEXT_WINDOW);
+        let none: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(none.resolve_context_window(), DEFAULT_CONTEXT_WINDOW);
     }
 }
 
@@ -414,6 +465,27 @@ fn strip_jsonc_comments(input: &str) -> String {
                         }
                     }
                     _ => out.push(c),
+                }
+            }
+            ',' => {
+                // JSONC allows a trailing comma before `}`/`]`; serde_json does
+                // not, and a silently ignored config file is worse than a lax
+                // parser. Whitespace after the comma is always kept.
+                let mut lookahead = String::new();
+                while let Some(&n) = chars.peek() {
+                    if n.is_whitespace() {
+                        lookahead.push(n);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                match chars.peek() {
+                    Some('}') | Some(']') => out.push_str(&lookahead),
+                    _ => {
+                        out.push(',');
+                        out.push_str(&lookahead);
+                    }
                 }
             }
             _ => out.push(c),

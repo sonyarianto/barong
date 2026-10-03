@@ -184,7 +184,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("barong-auth-prec-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         // Unique provider id so the env var can't collide with other tests.
-        // SAFETY: unique var name, no other test touches it.
+        // SAFETY: saved + restored; no other test touches this name.
+        let orig_testprov = std::env::var("TESTPROVXYZ_API_KEY").ok();
         unsafe { std::env::set_var("TESTPROVXYZ_API_KEY", "from-env"); }
         let cfg = Config::default();
         let a = AuthStore::load_from(dir.join("auth.json"));
@@ -194,7 +195,10 @@ mod tests {
         a.set("testprovxyz", "from-auth");
         let (k, src) = resolve_api_key("testprovxyz", &a, &cfg);
         assert_eq!((k.as_str(), src), ("from-auth", "auth.json"));
-        unsafe { std::env::remove_var("TESTPROVXYZ_API_KEY"); }
+        match orig_testprov {
+            Some(o) => unsafe { std::env::set_var("TESTPROVXYZ_API_KEY", o) },
+            None => unsafe { std::env::remove_var("TESTPROVXYZ_API_KEY"); },
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -203,13 +207,17 @@ mod tests {
         use crate::config::Config;
         // NINEROUTER_API_KEY is the shell-friendly spelling (9ROUTER_API_KEY
         // can't be `export`ed — leading digit).
-        // SAFETY: real name but near-zero collision in test envs; restored below.
+        // SAFETY: saved + restored; lock-free because no other test reads it.
+        let orig = std::env::var("NINEROUTER_API_KEY").ok();
         unsafe { std::env::set_var("NINEROUTER_API_KEY", "sk-9r-test"); }
         let dir = std::env::temp_dir().join(format!("barong-auth-9r-{}", std::process::id()));
         let cfg = Config::default();
         let a = AuthStore::load_from(dir.join("auth.json"));
         let (k, src) = resolve_api_key("9router", &a, &cfg);
         assert_eq!((k.as_str(), src), ("sk-9r-test", "env"));
-        unsafe { std::env::remove_var("NINEROUTER_API_KEY"); }
+        match orig {
+            Some(o) => unsafe { std::env::set_var("NINEROUTER_API_KEY", o) },
+            None => unsafe { std::env::remove_var("NINEROUTER_API_KEY"); },
+        }
     }
 }
