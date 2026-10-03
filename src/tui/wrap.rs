@@ -125,6 +125,19 @@ pub fn physical_rows(text: &str, width: u16) -> usize {
     rows_for_line(text, width)
 }
 
+/// Greedy word wrap of plain text at `width` cells, returning the rows.
+/// Every row keeps the source line's leading indent (a wrapped shell command
+/// or diff is unreadable without it) and words longer than a row are
+/// hard-broken. Always returns at least one row.
+pub fn wrap_text(text: &str, width: u16) -> Vec<String> {
+    wrap_plain(text, width)
+}
+
+/// Physical rows a plain multi-line string occupies at `width`.
+pub fn text_rows(text: &str, width: u16) -> usize {
+    text.split('\n').map(|l| rows_for_line(l, width)).sum()
+}
+
 /// Greedy word wrap of plain text at `width` cells, one output row per line of
 /// input. Every row keeps the source line's leading indent (a wrapped shell
 /// command or diff is unreadable without it) and words longer than a row are

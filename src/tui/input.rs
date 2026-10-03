@@ -678,11 +678,16 @@ pub fn picker_rows(app: &App, kind: &PickerKind, filter: &str) -> Vec<PickerRow>
             .collect(),
         PickerKind::Models => model_entries(app, filter)
             .into_iter()
-            .map(|(p, m, ready)| PickerRow {
-                complete: format!("/model {} ", model_label(&p, &m)),
-                left: format!("{:<10}", p),
-                right: crate::tui::ui::truncate(&model_label(&p, &m), 34),
-                dot: Some(ready),
+            .map(|(p, m, ready)| {
+                // Left column must be the unique key: two models of the same
+                // provider look identical if it only shows the provider.
+                let bare = m.strip_prefix(&format!("{}/", p)).unwrap_or(&m).to_string();
+                PickerRow {
+                    complete: format!("/model {} ", model_label(&p, &m)),
+                    left: p,
+                    right: bare,
+                    dot: Some(ready),
+                }
             })
             .collect(),
         PickerKind::Providers => provider_entries(app, filter)
@@ -1801,30 +1806,50 @@ mod tests {
     }
 
     #[test]
-    fn input_footer_shows_provider_model() {        use ratatui::{backend::TestBackend, Terminal};
+    fn prompt_box_has_accent_bar_endpoint_row_and_one_status_line() {
         let mut app = test_app();
-        // Type an @mention so chips render too.
         app.input.buffer = "read @src/main.rs".into();
-        app.input.cursor_pos = app.input.buffer.len();
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        terminal.draw(|f| app.render(f)).unwrap();
-        let buf = terminal.backend().buffer().clone();
-        // Layout: chat 0..19, input 19..22, footer 22, status 23.
-        let row: String = (0..80).map(|x| buf[(x, 22)].symbol().to_string()).collect();
-        assert!(row.contains(&app.provider_name), "footer: {}", row);
-        assert!(row.contains(&app.current_model), "footer: {}", row);
-        assert!(row.contains("@src/main.rs"), "footer: {}", row);
-        // Input zone is borderless (OpenCode-style): no box drawing, panel bg.
-        for y in 19..22 {
-            let line: String = (0..80).map(|x| buf[(x, y)].symbol().to_string()).collect();
-            assert!(!line.contains('╭') && !line.contains('╰') && !line.contains('╮') && !line.contains('╯'), "no box: {}", line);
-        }
-        assert_eq!(buf[(2, 19)].bg, app.theme.panel);
-        // Top breathing row is empty; typed text starts on the next row.
-        let pad: String = (0..80).map(|x| buf[(x, 19)].symbol().to_string()).collect();
-        assert!(pad.trim().is_empty(), "pad row: {:?}", pad);
-        let first: String = (0..80).map(|x| buf[(x, 20)].symbol().to_string()).collect();
-        assert!(first.contains("read @src/main.rs"), "content row: {}", first);
+        app.input.set_cursor(app.input.buffer.len());
+        let rows = draw_cells(&mut app, 80, 24);
+        let prompt = prompt_box(&rows, 24);
+        // draft + breathing row + endpoint row
+        assert_eq!(prompt.len(), 3, "{:?}", prompt);
+        assert!(prompt[0].contains("read @src/main.rs"), "draft: {:?}", prompt);
+        assert!(prompt[1].trim_start_matches('\u{258c}').trim().is_empty(), "breathing row: {:?}", prompt);
+        // The endpoint row lives inside the box, like OpenCode's agent/model line.
+        let endpoint = endpoint_row(&rows, 24);
+        assert!(endpoint.contains(&app.provider_name), "provider: {:?}", endpoint);
+        assert!(endpoint.contains(&app.current_model), "model: {:?}", endpoint);
+        assert!(
+            endpoint.contains(if app.permission_gate.auto_approve() { "auto" } else { "ask" }),
+            "mode: {:?}",
+            endpoint
+        );
+        // No leftover rule row: the status line follows the box directly.
+        let status = status_line(&rows, 24);
+        assert!(status.contains("msgs"), "status: {:?}", status);
+        assert!(status.contains('(') && status.contains('%'), "gauge: {:?}", status);
+        assert!(!status.contains("dark"), "theme name is not daily-use info: {:?}", status);
+        // The draft area carries the panel background.
+        assert_eq!(rows[21][3].bg, app.theme.panel);
+    }
+
+    #[test]
+    fn notice_lands_above_the_prompt_not_in_the_status_row() {
+        let mut app = test_app();
+        app.notice = Some("no API key for 'openai' — /login openai or set env".into());
+        let rows = draw_cells(&mut app, 80, 24);
+        let notice = notice_line(&rows, 24).expect("notice row");
+        assert!(notice.contains("no API key"), "notice: {:?}", notice);
+        assert!(
+            !status_line(&rows, 24).contains("no API key"),
+            "status must stay short: {:?}",
+            status_line(&rows, 24)
+        );
+        // And it disappears when there is nothing to say.
+        app.notice = None;
+        let rows = draw_cells(&mut app, 80, 24);
+        assert!(notice_line(&rows, 24).is_none(), "no empty notice row");
     }
 
     /// Full interactive audit through a headless terminal: picker opens for
@@ -1854,9 +1879,60 @@ mod tests {
         rows[y].iter().map(|c| c.symbol().to_string()).collect()
     }
 
-    /// The chat viewport only (chat is 0..h-5: input 3 + footer 1 + status 1).
+    /// Rows of the prompt box, found by its `▌` accent bar rather than by
+    /// counting from the bottom — layout changes must not silently break
+    /// assertions.
+    fn prompt_box(rows: &[Vec<ratatui::buffer::Cell>], h: u16) -> Vec<String> {
+        (0..h as usize)
+            .map(|y| row_text(rows, y))
+            .filter(|l| l.starts_with('\u{258c}'))
+            .collect()
+    }
+
+    /// The endpoint row: the last row of the box, naming provider/model/mode.
+    fn endpoint_row(rows: &[Vec<ratatui::buffer::Cell>], h: u16) -> String {
+        prompt_box(rows, h)
+            .last()
+            .cloned()
+            .unwrap_or_default()
+            .trim_start_matches('\u{258c}')
+            .trim()
+            .to_string()
+    }
+
+    /// Single status line, always the last row.
+    fn status_line(rows: &[Vec<ratatui::buffer::Cell>], h: u16) -> String {
+        row_text(rows, h as usize - 1)
+    }
+
+    /// The dim notice line, when one is showing (row above the prompt box).
+    fn notice_line(rows: &[Vec<ratatui::buffer::Cell>], h: u16) -> Option<String> {
+        let first_box = (0..h as usize).find(|&y| row_text(rows, y).starts_with('\u{258c}'))?;
+        if first_box == 0 {
+            return None;
+        }
+        let above = row_text(rows, first_box - 1);
+        if above.trim().is_empty() {
+            None
+        } else {
+            Some(above)
+        }
+    }
+
+    /// The chat viewport: everything above the notice/prompt chrome.
     fn chat_rows(rows: &[Vec<ratatui::buffer::Cell>], h: u16) -> Vec<String> {
-        (0..h as usize - 5).map(|y| row_text(rows, y)).collect()
+        let first_box = (0..h as usize).find(|&y| row_text(rows, y).starts_with('\u{258c}'));
+        let end = match first_box {
+            Some(b) => {
+                let mut e = b;
+                if e > 0 && !row_text(rows, e - 1).trim().is_empty() {
+                    e -= 1; // notice line
+                }
+                e
+            }
+            None => h as usize - 2,
+        };
+        (0..end).map(|y| row_text(rows, y)).collect()
     }
 
     /// A transcript whose every paragraph wraps: the case where counting
@@ -1995,16 +2071,22 @@ mod tests {
     }
 
     #[test]
-    fn busy_input_shows_the_draft_not_just_a_label() {
+    fn busy_prompt_stays_clean_and_the_interrupt_hint_lives_in_the_status_row() {
         let mut app = busy_app();
         app.input.buffer = "draft while busy".into();
         app.input.set_cursor(app.input.buffer.len());
         let rows = draw_cells(&mut app, 60, 16);
-        let panel: Vec<String> = (11..15).map(|y| row_text(&rows, y)).collect();
-        let joined = panel.join("\n");
-        assert!(joined.contains("draft while busy"), "draft must be visible:\n{}", joined);
-        assert!(joined.contains('\u{2588}'), "cursor must be visible:\n{}", joined);
-        assert!(joined.contains("Esc to cancel"), "hint must stay:\n{}", joined);
+        let prompt = prompt_box(&rows, 16);
+        assert_eq!(prompt.len(), 3, "{:?}", prompt);
+        assert!(prompt[0].contains("draft while busy"), "draft visible: {:?}", prompt);
+        assert!(prompt[0].contains('\u{2588}'), "cursor visible: {:?}", prompt);
+        // No instructional text crammed into the box.
+        let whole = prompt.join(" ");
+        assert!(!whole.contains("Esc to cancel"), "box must stay clean: {:?}", whole);
+        // The activity sweep + interrupt hint are on the status row instead.
+        let status = status_line(&rows, 16);
+        assert!(status.contains("esc interrupt"), "status: {:?}", status);
+        assert!(status.contains('\u{25aa}') || status.contains('\u{00b7}'), "sweep: {:?}", status);
     }
 
     #[test]
@@ -2108,11 +2190,12 @@ mod tests {
     }
 
     #[test]
-    fn footer_shows_queue_depth() {
+    fn status_row_shows_queue_depth() {
         let mut app = busy_app();
         app.queued_input = vec!["a".into(), "b".into()];
         let rows = draw_cells(&mut app, 80, 16);
-        assert!(row_text(&rows, 14).contains("2 queued"), "footer: {}", row_text(&rows, 14));
+        let status = status_line(&rows, 16);
+        assert!(status.contains("+2 queued"), "status: {}", status);
     }
 
     // --- input panel: the cursor stays visible on a long wrapped line ---
@@ -2123,11 +2206,11 @@ mod tests {
         app.input.buffer = "q".repeat(200);
         app.input.set_cursor(app.input.buffer.len());
         let rows = draw_cells(&mut app, 40, 24);
-        let panel: Vec<String> = (19..22).map(|y| row_text(&rows, y)).collect();
+        let prompt = prompt_box(&rows, 24);
         assert!(
-            panel.iter().any(|l| l.contains('\u{2588}')),
-            "block cursor must be inside the 3-row panel:\n{}",
-            panel.join("\n")
+            prompt.iter().any(|l| l.contains('\u{2588}')),
+            "block cursor must be inside the prompt box:\n{}",
+            prompt.join("\n")
         );
     }
 
@@ -2139,12 +2222,12 @@ mod tests {
             app.input.buffer = "q".repeat(200);
             app.input.set_cursor(cursor);
             let rows = draw_cells(&mut app, 40, 24);
-            let panel: Vec<String> = (19..22).map(|y| row_text(&rows, y)).collect();
+            let prompt = prompt_box(&rows, 24);
             assert!(
-                panel.iter().any(|l| l.contains('\u{2588}')),
+                prompt.iter().any(|l| l.contains('\u{2588}')),
                 "cursor at {} not rendered:\n{}",
                 cursor,
-                panel.join("\n")
+                prompt.join("\n")
             );
         }
     }
@@ -2155,8 +2238,8 @@ mod tests {
         app.input.buffer = "satu\ndua\ntiga\nempat\nlima\nenam\ntujuh".into();
         app.input.set_cursor(app.input.buffer.len());
         let rows = draw_cells(&mut app, 40, 24);
-        let panel: Vec<String> = (19..22).map(|y| row_text(&rows, y)).collect();
-        let joined = panel.join("\n");
+        let prompt = prompt_box(&rows, 24);
+        let joined = prompt.join("\n");
         assert!(joined.contains('\u{2588}'), "cursor must show:\n{}", joined);
         assert!(joined.contains("tujuh"), "and the text it sits on:\n{}", joined);
     }
@@ -2303,23 +2386,25 @@ mod tests {
             app.input.buffer = "/model ".into();
             app.input.set_cursor(app.input.buffer.len());
             let rows = draw_cells(&mut app, w, h);
-            let input_top = h as usize - 5;
+            let box_top = (0..h as usize)
+                .find(|&y| row_text(&rows, y).starts_with('\u{258c}'))
+                .unwrap_or_else(|| panic!("prompt box must exist at {}x{}", w, h));
             match picker_span(&rows, h) {
                 None => panic!("picker must open at {}x{}", w, h),
                 Some((_, bottom)) => assert!(
-                    bottom < input_top,
-                    "picker bottom {} overlaps the input (top {}) at {}x{}",
+                    bottom < box_top,
+                    "picker bottom {} overlaps the prompt box (top {}) at {}x{}",
                     bottom,
-                    input_top,
+                    box_top,
                     w,
                     h
                 ),
             }
-            // The input row keeps its own content.
-            let first = row_text(&rows, input_top + 1);
+            // The prompt row keeps its own content.
+            let first = row_text(&rows, box_top);
             assert!(
                 first.contains("/model"),
-                "input must still show the draft at {}x{}: {:?}",
+                "prompt must still show the draft at {}x{}: {:?}",
                 w,
                 h,
                 first
@@ -2872,12 +2957,12 @@ mod tests {
         app.input.buffer = "caf\u{e9}plain".into();
         app.input.cursor_pos = 4;
         let rows = draw_cells(&mut app, 60, 24);
-        let line: String = rows[20].iter().map(|c| c.symbol().to_string()).collect();
-        assert!(line.contains("caf"), "got: {}", line);
+        let prompt = prompt_box(&rows, 24).join("\n");
+        assert!(prompt.contains("caf"), "got: {}", prompt);
         assert!(
-            line.contains('\u{2588}'),
+            prompt.contains('\u{2588}'),
             "block cursor must render, got: {}",
-            line
+            prompt
         );
     }
 
@@ -2897,6 +2982,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
 
 
 

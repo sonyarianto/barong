@@ -7,12 +7,19 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
+    // Bottom chrome, OpenCode-style: `┃` prompt rows, a `╹▀` closing rule and
+    // one status line. Three rows when idle instead of five — the frame is the
+    // padding, so there are no blank filler rows.
+    let box_rows = prompt_box_rows(app, area.width);
+    let notice_rows = u16::from(app.notice.is_some());
+    let chrome = notice_rows + box_rows + 1; // status
+    let chat_rows = area.height.saturating_sub(chrome).max(1);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(1),
-            Constraint::Length(3),
-            Constraint::Length(1),
+            Constraint::Length(chat_rows),
+            Constraint::Length(notice_rows),
+            Constraint::Length(box_rows),
             Constraint::Length(1),
         ])
         .split(area);
@@ -27,7 +34,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     } else {
         render_chat(frame, chunks[0], app);
     }
-    render_input(frame, chunks[1], app);
+    render_notice(frame, chunks[1], app);
+    render_prompt(frame, chunks[2], app);
     // One picker overlay for every mode (same chrome, same keys).
     let idle =
         app.event_rx.is_none() && app.pending_approval.is_none() && app.pending_login.is_none();
@@ -36,7 +44,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             let rows = crate::tui::input::picker_rows(app, &kind, &filter);
             if !rows.is_empty() {
                 let title = crate::tui::input::picker_title(&kind);
-                render_picker(frame, chunks[0], chunks[1], app, title, &rows);
+                render_picker(frame, chunks[0], chunks[2], app, title, &rows);
             }
         } else if app.input.buffer.starts_with('/') {
             // Text after a space ("/foo bar") matches no picker: show nothing.
@@ -51,11 +59,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                         dot: None,
                     })
                     .collect();
-                render_picker(frame, chunks[0], chunks[1], app, "", &rows);
+                render_picker(frame, chunks[0], chunks[2], app, "", &rows);
             }
         }
     }
-    render_input_footer(frame, chunks[2], app);
     render_status(frame, chunks[3], app);
     if app.pending_approval.is_some() {
         render_permission_modal(frame, area, app);
@@ -64,44 +71,6 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
 /// OpenCode-style input footer: active `provider/model` at the typing point
 /// (status bar no longer duplicates it) + approval state + `@file` chips.
-fn render_input_footer(frame: &mut Frame, area: Rect, app: &App) {
-    let t = &app.theme;
-    let mut parts = vec![Span::styled(
-        format!(
-            " {}/{}",
-            app.provider_name,
-            truncate(&app.current_model, 32)
-        ),
-        Style::default().fg(t.accent),
-    )];
-    parts.push(Span::styled(" · ", Style::default().fg(t.muted)));
-    if app.permission_gate.auto_approve() {
-        parts.push(Span::styled("auto", Style::default().fg(t.muted)));
-    } else {
-        parts.push(Span::styled("ask", Style::default().fg(t.warning)));
-    }
-    for f in crate::tui::input::mention_tokens(&app.input.buffer) {
-        parts.push(Span::styled(" · ", Style::default().fg(t.muted)));
-        parts.push(Span::styled(
-            format!("@{}", truncate(&f, 24)),
-            Style::default().fg(t.accent),
-        ));
-    }
-    if !app.queued_input.is_empty() {
-        parts.push(Span::styled(" · ", Style::default().fg(t.muted)));
-        parts.push(Span::styled(
-            format!("{} queued", app.queued_input.len()),
-            Style::default().fg(t.accent),
-        ));
-    }
-    if app.pending_login.is_some() {
-        parts.push(Span::styled(" · login…", Style::default().fg(t.warning)));
-    } else if app.pending_approval.is_some() {
-        parts.push(Span::styled(" · approval…", Style::default().fg(t.warning)));
-    }
-    frame.render_widget(Paragraph::new(Line::from(parts)), area);
-}
-
 fn render_tree(frame: &mut Frame, area: Rect, app: &App) {
     let t = &app.theme;
     let mut lines: Vec<Line> = Vec::new();
@@ -204,14 +173,6 @@ fn render_chat(frame: &mut Frame, area: Rect, app: &mut App) {
                 .fg(t.primary)
                 .add_modifier(Modifier::SLOW_BLINK),
         )));
-    } else if app.event_rx.is_some() {
-        app.spinner_tick = app.spinner_tick.wrapping_add(1);
-        let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-        let f = frames[(app.spinner_tick / 4) % frames.len()];
-        all_lines.push(Line::from(Span::styled(
-            format!("{} working… (Esc to cancel)", f),
-            Style::default().fg(t.warning),
-        )));
     }
 
     // Bottom-follow scrolling.
@@ -311,109 +272,252 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
     format!("{}…", t)
 }
 
-fn render_input(frame: &mut Frame, area: Rect, app: &App) {
-    let t = &app.theme;
-    let busy = app.event_rx.is_some();
-    // OpenCode-style: no border box — full-bleed panel backdrop + text.
-    // The backdrop is a borderless block so wrap/clip never breaks alignment.
-    frame.render_widget(Block::default().style(Style::default().bg(t.panel)), area);
-    // Small horizontal inset so text doesn't touch the terminal edge.
-    let inner = Rect::new(
-        area.x.saturating_add(1),
-        area.y,
-        area.width.saturating_sub(1),
-        area.height,
-    );
+/// Longest the prompt box grows before it starts scrolling.
+const MAX_PROMPT_ROWS: u16 = 8;
+/// `┃` + one space of inset on each side.
+const PROMPT_INSET: u16 = 3;
+const PROMPT_PLACEHOLDER: &str = "message · / commands · @ files";
 
-    if let Some(pid) = &app.pending_login {
-        let masked = "•".repeat(app.login_buffer.chars().count().min(48));
-        let line = Line::from(vec![
-            Span::styled(
-                format!("key for {}: ", pid),
-                Style::default().fg(t.accent).bg(t.panel),
-            ),
-            Span::raw(masked),
-            Span::styled(
-                "█",
-                Style::default()
-                    .fg(t.accent)
-                    .bg(t.panel)
-                    .add_modifier(Modifier::SLOW_BLINK),
-            ),
-        ]);
-        frame.render_widget(Paragraph::new(line), inner);
-        return;
-    }
-
-    let mut display = app.input.buffer.clone();
-    // block cursor — cursor_pos is a byte offset, snap it to a boundary first
-    let cursor = app.input.cursor();
-    display.insert(cursor, '█');
-    let bg = Style::default().bg(t.panel);
-    // Row 0 is chrome, the draft starts on row 1: a blank breathing row when
-    // idle, the cancel hint while the agent works (the draft stays visible and
-    // editable — Enter queues it instead of throwing it away).
-    let mut rows = vec![if busy {
-        let label = if app.pending_approval.is_some() {
-            "(y/a/n to decide)"
-        } else {
-            "(Esc to cancel · Enter queues)"
-        };
-        Line::from(Span::styled(
-            label,
-            Style::default().fg(t.muted).bg(t.panel),
-        ))
-    } else {
-        Line::from(Span::styled("", bg))
-    }];
-    let placeholder = if busy {
-        "type the next message, Enter queues it"
-    } else {
-        "message, / commands, @ files"
-    };
-    if app.input.buffer.is_empty() && !app.input.buffer.starts_with('/') {
-        rows.push(Line::from(vec![
-            Span::styled("█", Style::default().fg(t.accent).bg(t.panel)),
-            Span::styled(placeholder, Style::default().fg(t.muted).bg(t.panel)),
-        ]));
-    } else {
-        rows.extend(
-            display
-                .split('\n')
-                .map(|row| Line::from(Span::styled(row.to_string(), bg))),
-        );
-    }
-    // Keep the cursor's row visible. `Paragraph` wraps and scrolls in PHYSICAL
-    // rows, so the cursor's row has to be counted the same way: a long single
-    // line is many rows tall and used to scroll the cursor clean off the panel.
-    let cursor_row = 1 + physical_row_of_cursor(&display, cursor, inner.width.max(1));
-    let visible = area.height.max(1) as usize;
-    // Park the cursor on the last visible row.
-    let scroll = (cursor_row + 1).saturating_sub(visible);
-    let p = Paragraph::new(rows)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll as u16, 0));
-    frame.render_widget(p, inner);
+/// The row inside the box that names the endpoint, mirroring OpenCode's
+/// `agent · model · variant` line.
+struct EndpointLine {
+    provider: String,
+    model: String,
+    mode: String,
+    mode_style: Style,
 }
 
-/// Physical row (0-based, inside the input panel) holding the block cursor.
-///
-/// `cursor` is the byte offset where the block glyph was inserted into
-/// `display`. The glyph itself is included in the measured prefix, so a cursor
-/// sitting exactly on a wrap boundary lands on the row it is painted on rather
-/// than the one before it.
-fn physical_row_of_cursor(display: &str, cursor: usize, width: u16) -> usize {
-    const BLOCK: char = '█';
-    let end = (floor_boundary(display, cursor) + BLOCK.len_utf8()).min(display.len());
-    let head = &display[..end];
-    let mut rows = 0usize;
+impl EndpointLine {
+    fn build(app: &App) -> Self {
+        let t = &app.theme;
+        let (mode, mode_style) = if app.permission_gate.auto_approve() {
+            ("auto".to_string(), Style::default().fg(t.success))
+        } else {
+            ("ask".to_string(), Style::default().fg(t.warning))
+        };
+        Self {
+            provider: app.provider_name.clone(),
+            model: app.current_model.clone(),
+            mode,
+            mode_style,
+        }
+    }
+
+    /// One row that degrades by dropping whole segments rather than clipping
+    /// mid-word: `provider · model · mode` → `model · mode` → `model`.
+    fn spans(&self, width: u16, t: &crate::tui::theme::Theme) -> Vec<Span<'static>> {
+        let dot = Style::default().fg(t.muted);
+        let model = self.model.clone();
+        let mut segs: Vec<(String, Style)> = vec![
+            (self.provider.clone(), Style::default().fg(t.accent)),
+            (model.clone(), Style::default()),
+            (self.mode.clone(), self.mode_style),
+        ];
+        // Keep the last segments first, then prepend while there is room.
+        let w = width as usize;
+        loop {
+            let total: usize =
+                segs.iter().map(|(t2, _)| display_cells(t2)).sum::<usize>() + 3 * (segs.len() - 1);
+            if total <= w || segs.len() <= 1 {
+                break;
+            }
+            segs.remove(0);
+        }
+        // Whatever is left may still need shortening.
+        let total: usize =
+            segs.iter().map(|(t2, _)| display_cells(t2)).sum::<usize>() + 3 * (segs.len() - 1);
+        if total > w && segs.len() == 1 {
+            segs[0].0 = truncate_middle(&segs[0].0, w);
+        }
+        let mut out: Vec<Span<'static>> = Vec::new();
+        for (i, (text, style)) in segs.into_iter().enumerate() {
+            if i > 0 {
+                out.push(Span::styled(" · ", dot));
+            }
+            out.push(Span::styled(text, style));
+        }
+        out
+    }
+}
+
+/// Busy indicator: a single segment sweeping across dim cells. Indeterminate on
+/// purpose — we have no completion percentage, and a bar that fills to 100%
+/// would be a lie.
+fn progress_sweep<'a>(tick: usize, t: &'a crate::tui::theme::Theme) -> Vec<Span<'a>> {
+    const CELLS: usize = 8;
+    // Indeterminate: one accent head sweeping across dim dots, pausing a beat
+    // at each end. A bar that filled to 100% would imply progress we don't have.
+    let pos = tick % (CELLS + 2);
+    let head = if pos < CELLS { Some(pos) } else { None };
+    let mut out: Vec<Span<'a>> = Vec::new();
+    match head {
+        Some(h) => {
+            if h > 0 {
+                out.push(Span::styled("·".repeat(h), Style::default().fg(t.muted)));
+            }
+            out.push(Span::styled("▪", Style::default().fg(t.accent)));
+            let rest = CELLS - h - 1;
+            if rest > 0 {
+                out.push(Span::styled("·".repeat(rest), Style::default().fg(t.muted)));
+            }
+        }
+        None => out.push(Span::styled(
+            "·".repeat(CELLS),
+            Style::default().fg(t.muted),
+        )),
+    }
+    out
+}
+
+/// Truncate from the middle so both ends of a long model id stay readable.
+fn truncate_middle(s: &str, max: usize) -> String {
+    if display_cells(s) <= max {
+        return s.to_string();
+    }
+    let keep = max.saturating_sub(1);
+    let head = keep / 2;
+    let tail = keep - head;
+    let head: String = s.chars().take(head).collect();
+    let tail: String = {
+        let all: Vec<char> = s.chars().collect();
+        if tail == 0 {
+            String::new()
+        } else {
+            all[all.len() - tail..].iter().collect()
+        }
+    };
+    format!("{}…{}", head, tail)
+}
+
+/// Rows the prompt box needs: the wrapped draft plus a blank breathing row and
+/// the endpoint row.
+fn prompt_box_rows(app: &App, area_width: u16) -> u16 {
+    let inner = area_width.saturating_sub(PROMPT_INSET).max(8);
+    let draft = crate::tui::wrap::text_rows(&prompt_draft_text(app), inner) as u16;
+    draft.saturating_add(2).clamp(3, MAX_PROMPT_ROWS)
+}
+
+/// What the prompt line shows when there is nothing typed.
+fn prompt_draft_text(app: &App) -> String {
+    if let Some(pid) = &app.pending_login {
+        let masked = "•".repeat(app.login_buffer.chars().count().min(48));
+        return format!("key for {}: {}", pid, masked);
+    }
+    if app.input.buffer.is_empty() && !app.input.buffer.starts_with('/') {
+        return PROMPT_PLACEHOLDER.to_string();
+    }
+    let cursor = app.input.cursor();
+    let mut display = app.input.buffer.clone();
+    display.insert(cursor, '█');
+    display
+}
+
+/// Transient warning line above the prompt. Notices used to sit in the status
+/// bar, where a long message pushed everything else off screen.
+fn render_notice(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(text) = &app.notice else { return };
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let t = &app.theme;
+    let line = Line::from(vec![
+        Span::styled("▎ ", Style::default().fg(t.warning)),
+        Span::styled(
+            truncate(text, area.width.saturating_sub(3) as usize),
+            Style::default().fg(t.warning),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+/// The prompt box: thick accent bar, panel background, draft on top and the
+/// endpoint row at the bottom (OpenCode's shape).
+fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let t = &app.theme;
+    let inner_w = area.width.saturating_sub(PROMPT_INSET).max(1);
+    let draft_text = prompt_draft_text(app);
+    let rows = crate::tui::wrap::wrap_text(&draft_text, inner_w);
+    let height = area.height;
+    let endpoint = EndpointLine::build(app);
+
+    // Keep the cursor on the last visible row when the draft outgrows the box.
+    let cursor_row = prompt_cursor_row(app, inner_w);
+    let scroll = cursor_row
+        .saturating_sub(height.saturating_sub(3))
+        .min((rows.len() as u16).saturating_sub(1));
+
+    let is_placeholder = app.input.buffer.is_empty() && app.pending_login.is_none();
+    let draft_style = Style::default().bg(t.panel).fg(if is_placeholder {
+        t.muted
+    } else {
+        Color::Reset
+    });
+    let bar = Style::default().fg(t.accent).bg(t.panel);
+
+    for row in 0..height {
+        // Last two rows are the breathing row and the endpoint row.
+        let text = if row + 2 >= height {
+            String::new()
+        } else {
+            rows.get((scroll + row) as usize)
+                .cloned()
+                .unwrap_or_default()
+        };
+        let mut spans = vec![
+            Span::styled("\u{258c} ", bar),
+            Span::styled(text, draft_style),
+        ];
+        if row + 1 == height {
+            // Endpoint row lives inside the box, hard left.
+            let mut line = endpoint.spans(area.width.saturating_sub(PROMPT_INSET), t);
+            let used: usize = 2 + line
+                .iter()
+                .map(|s| display_cells(&s.content))
+                .sum::<usize>();
+            spans.append(&mut line);
+            spans.push(Span::styled(
+                " ".repeat((area.width as usize).saturating_sub(used)),
+                Style::default().bg(t.panel),
+            ));
+        } else {
+            let used = 2 + display_cells(&spans[1].content) as usize;
+            spans.push(Span::styled(
+                " ".repeat((area.width as usize).saturating_sub(used)),
+                Style::default().bg(t.panel),
+            ));
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect::new(area.x, area.y + row, area.width, 1),
+        );
+    }
+}
+
+/// Row index (within the wrapped prompt rows) that the block cursor sits on.
+fn prompt_cursor_row(app: &App, inner: u16) -> u16 {
+    if app.pending_login.is_some() {
+        return 0;
+    }
+    if app.input.buffer.is_empty() {
+        return 0;
+    }
+    let cursor = app.input.cursor();
+    let display = {
+        let mut d = app.input.buffer.clone();
+        d.insert(cursor, '█');
+        d
+    };
+    let head = &display[..floor_boundary(&display, cursor + '█'.len_utf8())];
+    let mut row = 0u16;
     let mut rest = head;
-    // Complete lines before the cursor's own line.
     while let Some(idx) = rest.find('\n') {
-        rows += crate::tui::wrap::physical_rows(&rest[..idx], width);
+        row += crate::tui::wrap::text_rows(&rest[..idx], inner) as u16;
         rest = &rest[idx + 1..];
     }
-    rows + crate::tui::wrap::physical_rows(rest, width).saturating_sub(1)
+    row + crate::tui::wrap::text_rows(rest, inner).saturating_sub(1) as u16
 }
 
 /// Largest char boundary at or below `at`.
@@ -425,8 +529,6 @@ fn floor_boundary(s: &str, at: usize) -> usize {
     i
 }
 
-/// The one picker overlay for every mode: same window math, same highlight,
-/// same keys. `title` empty = bare command list; otherwise `kind n/m`.
 fn render_picker(
     frame: &mut Frame,
     chat: Rect,
@@ -493,21 +595,30 @@ fn render_picker(
                 ));
             }
             let avail = inner_w.saturating_sub(dot_w);
-            let left_w = avail.min(12);
-            spans.push(Span::styled(
-                format!(" {}", truncate(&row.left, left_w.max(1))),
-                label_style,
-            ));
-            // Only spend cells on the description if it gets a readable run.
-            let right_w = avail.saturating_sub(left_w.min(avail));
-            if right_w >= 8 {
-                let room = right_w.saturating_sub(1);
-                let text = if row.right.is_empty() {
-                    String::new()
+            let right_w = display_cells(&row.right);
+            // Two columns only when both get a readable run. Otherwise merge
+            // them: a model list that cannot tell its entries apart is useless.
+            if right_w > 0 && avail >= 12 && avail - 12 >= 8 {
+                spans.push(Span::styled(
+                    format!(" {}", truncate(&row.left, 12)),
+                    label_style,
+                ));
+                spans.push(Span::styled(
+                    format!(" {}", truncate(&row.right, avail - 13)),
+                    detail_style,
+                ));
+            } else {
+                let merged = if row.right.is_empty() {
+                    row.left.clone()
+                } else if row.left.is_empty() {
+                    row.right.clone()
                 } else {
-                    format!(" {}", truncate(&row.right, room))
+                    format!("{} {}", row.left, row.right)
                 };
-                spans.push(Span::styled(text, detail_style));
+                spans.push(Span::styled(
+                    format!(" {}", truncate(&merged, avail.max(1))),
+                    label_style,
+                ));
             }
             // Pad out to the full inner width so the highlight spans the row.
             let painted: usize = spans.iter().map(|s| display_cells(&s.content)).sum();
@@ -535,69 +646,75 @@ fn render_picker(
     frame.render_widget(List::new(list_items).block(block), area);
 }
 
-fn render_status(frame: &mut Frame, area: Rect, app: &App) {
+/// `1.2k` / `18.1k` / `1.4M` — compact, like OpenCode's context readout.
+fn format_tokens(n: usize) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f32 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f32 / 1_000.0)
+    } else {
+        format!("{}", n)
+    }
+}
+
+/// One row under the box. While the agent works the left side becomes the
+/// activity sweep plus `esc interrupt`; otherwise it is `path · branch`.
+/// Right side is `msgs · tokens (pct)`.
+fn render_status(frame: &mut Frame, area: Rect, app: &mut App) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
     let t = &app.theme;
-    let ctx = (app.context_usage() * 100.0) as u32;
-    let ctx_color = if ctx > 85 {
+    let dim = Style::default().fg(t.muted);
+
+    let mut left: Vec<Span> = vec![Span::styled(" ", dim)];
+    if app.event_rx.is_some() {
+        app.spinner_tick = app.spinner_tick.wrapping_add(1);
+        left.extend(progress_sweep(app.spinner_tick, t));
+        left.push(Span::styled(" esc interrupt", Style::default()));
+        if !app.queued_input.is_empty() {
+            left.push(Span::styled(
+                format!("  +{} queued", app.queued_input.len()),
+                Style::default().fg(t.accent),
+            ));
+        }
+    } else {
+        let mut path = app.cwd_short();
+        if app.workspace.is_git_repo && !app.workspace.git_branch.is_empty() {
+            path.push_str(&format!(" · {}", app.workspace.git_branch));
+        }
+        left.push(Span::styled(path, dim));
+    }
+
+    let msgs = app.conversation.messages.len();
+    let ctx_pct = (app.context_usage() * 100.0) as u32;
+    let ctx_color = if ctx_pct > 85 {
         t.error
-    } else if ctx > 60 {
+    } else if ctx_pct > 60 {
         t.warning
     } else {
         t.muted
     };
-    // `~` marks the reading as an estimate; without it the provider reported it.
-    let ctx_label = if app.context_is_estimated() {
-        format!("ctx:~{}%", ctx)
+    let tokens = if app.context_is_estimated() {
+        format!("~{}", format_tokens(app.estimated_prompt_tokens()))
     } else {
-        format!("ctx:{}%", ctx)
+        format_tokens(app.last_prompt_tokens.unwrap_or(0))
     };
-    let mut parts = vec![
-        Span::styled(
-            format!(" {}", app.cwd_short()),
-            Style::default().fg(t.muted),
-        ),
-        Span::styled(" │ ", Style::default().fg(t.muted)),
-        Span::styled(
-            format!("msgs:{}", app.conversation.messages.len()),
-            Style::default().fg(t.muted),
-        ),
-        Span::styled(" │ ", Style::default().fg(t.muted)),
-        Span::styled(ctx_label, Style::default().fg(ctx_color)),
-        Span::styled(" │ ", Style::default().fg(t.muted)),
-        Span::styled(t.name.clone(), Style::default().fg(t.muted)),
-    ];
-    if app.tree_visible {
-        parts.push(Span::styled(" │ tree", Style::default().fg(t.accent)));
-    }
-    if !app.status.token_count.is_empty() {
-        parts.push(Span::styled(" │ ", Style::default().fg(t.muted)));
-        parts.push(Span::styled(
-            app.status.token_count.clone(),
-            Style::default().fg(t.muted),
+    let right = format!("{} msgs · {} ({}%)", msgs, tokens, ctx_pct);
+
+    let left_w: u16 = left.iter().map(|s| display_cells(&s.content) as u16).sum();
+    let right_w = display_cells(&right) as u16;
+    let mut spans = left;
+    if left_w + right_w + 2 <= area.width {
+        spans.push(Span::styled(
+            " ".repeat((area.width - left_w - right_w) as usize),
+            dim,
         ));
     }
-    if app.event_rx.is_some() {
-        parts.push(Span::styled(" │ working…", Style::default().fg(t.warning)));
-    } else if app.status.tool_status != "idle" && !app.status.tool_status.is_empty() {
-        parts.push(Span::styled(
-            format!(" │ {}", app.status.tool_status),
-            Style::default().fg(t.warning),
-        ));
-    }
-    if let Some(n) = &app.notice {
-        parts.push(Span::styled(" │ ", Style::default().fg(t.muted)));
-        parts.push(Span::styled(truncate(n, 60), Style::default().fg(t.accent)));
-    }
-    let p = Paragraph::new(Line::from(parts));
-    frame.render_widget(p, area);
+    spans.push(Span::styled(right, Style::default().fg(ctx_color)));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// Rows of chrome around the body: top border, blank, key row, bottom border.
-const APPROVAL_CHROME: u16 = 4;/// Payload lines shown before the modal admits what it hid.
-const APPROVAL_MAX_LINES: usize = 24;
-
-/// Cap a payload at `APPROVAL_MAX_LINES`, returning the head and how many
-/// lines were dropped.
 fn capped(body: &str) -> (String, usize) {
     let lines: Vec<&str> = body.lines().collect();
     if lines.len() <= APPROVAL_MAX_LINES {
@@ -739,6 +856,11 @@ fn approval_body(
     }
     out
 }
+
+/// Rows of chrome around the body: top border, blank, key row, bottom border.
+const APPROVAL_CHROME: u16 = 4;
+/// Payload lines shown before the modal admits what it hid.
+const APPROVAL_MAX_LINES: usize = 24;
 
 fn render_permission_modal(frame: &mut Frame, area: Rect, app: &App) {
     let Some(p) = &app.pending_approval else {

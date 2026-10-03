@@ -357,7 +357,7 @@ impl App {
 
     /// chars/4 over the whole outgoing payload. `prompt_overhead_chars` is
     /// refreshed on every run; the file tree is counted once, not twice.
-    fn estimated_prompt_tokens(&self) -> usize {
+    pub fn estimated_prompt_tokens(&self) -> usize {
         let mut chars = self.prompt_overhead_chars;
         for m in &self.conversation.messages {
             chars += m.content.as_deref().unwrap_or("").len();
