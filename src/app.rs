@@ -41,8 +41,11 @@ pub struct App {
     pub cancelled: Arc<AtomicBool>,
     pub is_home: bool,
     // UX state (minimal)
-    pub palette_idx: usize,
-    pub palette_navigated: bool,
+    /// Single picker state for every overlay (commands, models, login,
+    /// choices). One interaction model everywhere: type to filter,
+    /// Up/Down to move, Tab to complete, Enter to confirm, Esc to back out.
+    pub picker_idx: usize,
+    pub picker_navigated: bool,
     pub tool_expanded: bool,
     pub notice: Option<String>,
     pub spinner_tick: usize,
@@ -55,13 +58,6 @@ pub struct App {
     pub discovered: Discovered,
     pub pending_login: Option<String>,
     pub login_buffer: String,
-    pub model_idx: usize,
-    pub model_navigated: bool,
-    pub login_idx: usize,
-    pub login_navigated: bool,
-    /// Generic choice picker (theme/approve/compact/allow/resume/logout).
-    pub choice_idx: usize,
-    pub choice_navigated: bool,
 }
 
 impl App {
@@ -164,8 +160,8 @@ impl App {
             current_model: current_model.clone(),
             cancelled: Arc::new(AtomicBool::new(false)),
             is_home,
-            palette_idx: 0,
-            palette_navigated: false,
+            picker_idx: 0,
+            picker_navigated: false,
             tool_expanded: false,
             notice: if initial_key.is_empty() {
                 Some(format!("no API key for '{}' — /login {} or set env", provider_name, provider_name))
@@ -185,12 +181,6 @@ impl App {
             discovered: Discovered::load(),
             pending_login: None,
             login_buffer: String::new(),
-            model_idx: 0,
-            model_navigated: false,
-            login_idx: 0,
-            login_navigated: false,
-            choice_idx: 0,
-            choice_navigated: false,
         }
     }
 

@@ -28,21 +28,31 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         render_chat(frame, chunks[0], app);
     }
     render_input(frame, chunks[1], app);
-    // pickers overlay above input (model/login/choice pickers take over palette)
-    let model_mode = crate::tui::input::model_filter(&app.input.buffer).is_some();
-    let login_mode = app.input.buffer.starts_with("/login ");
-    let choice = crate::tui::input::choice_mode(&app.input.buffer);
+    // One picker overlay for every mode (same chrome, same keys).
     let idle = app.event_rx.is_none() && app.pending_approval.is_none() && app.pending_login.is_none();
-    if model_mode && idle {
-        render_model_picker(frame, chunks[0], chunks[1], app);
-    } else if login_mode && idle {
-        render_login_picker(frame, chunks[0], chunks[1], app);
-    } else if let Some((mode, _)) = choice {
-        if idle {
-            render_choice_picker(frame, chunks[0], chunks[1], app, &mode);
+    if idle {
+        if let Some((kind, filter)) = crate::tui::input::picker_kind(&app.input.buffer) {
+            let rows = crate::tui::input::picker_rows(app, &kind, &filter);
+            if !rows.is_empty() {
+                let title = crate::tui::input::picker_title(&kind);
+                render_picker(frame, chunks[0], chunks[1], app, title, &rows);
+            }
+        } else if app.input.buffer.starts_with('/') {
+            // Text after a space ("/foo bar") matches no picker: show nothing.
+            let items = crate::tui::input::command_palette(&app.input.buffer);
+            if !items.is_empty() && !app.input.buffer.contains([' ', '\n']) {
+                let rows: Vec<crate::tui::input::PickerRow> = items
+                    .into_iter()
+                    .map(|(n, d)| crate::tui::input::PickerRow {
+                        complete: format!("{} ", n),
+                        left: format!("{:<12}", n),
+                        right: d.to_string(),
+                        dot: None,
+                    })
+                    .collect();
+                render_picker(frame, chunks[0], chunks[1], app, "", &rows);
+            }
         }
-    } else if app.input.buffer.starts_with('/') && idle {
-        render_palette(frame, chunks[0], chunks[1], app);
     }
     render_input_footer(frame, chunks[2], app);
     render_status(frame, chunks[3], app);
@@ -248,7 +258,7 @@ fn compact_tool_lines<'a>(content: &'a str, expanded: bool, t: &'a crate::tui::t
     ))]
 }
 
-fn truncate(s: &str, max: usize) -> String {
+pub(crate) fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }
@@ -329,179 +339,71 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(p, inner);
 }
 
-fn render_palette(frame: &mut Frame, chat: Rect, input: Rect, app: &App) {
-    let items = crate::tui::input::command_palette(&app.input.buffer);
-    if items.is_empty() {
+/// The one picker overlay for every mode: same window math, same highlight,
+/// same keys. `title` empty = bare command list; otherwise `kind n/m`.
+fn render_picker(
+    frame: &mut Frame,
+    chat: Rect,
+    input: Rect,
+    app: &App,
+    title: &str,
+    rows: &[crate::tui::input::PickerRow],
+) {
+    if rows.is_empty() {
         return;
     }
     // Scrolling window so selected item is always visible.
-    let visible = items.len().min(8);
-    let selected = app.palette_idx % items.len();
+    let visible = rows.len().min(8);
+    let selected = app.picker_idx % rows.len();
     // Keep selected inside window: pin start so window contains selected.
-    let max_start = items.len().saturating_sub(visible);
+    let max_start = rows.len().saturating_sub(visible);
     let start = (selected.saturating_sub(visible.saturating_sub(1))).min(max_start);
-    let end = (start + visible).min(items.len());
+    let end = (start + visible).min(rows.len());
     let height = (visible + 2) as u16;
-    let width = input.width.min(60);
+    let width = input.width.min(64);
     let x = input.x;
     let y = input.y.saturating_sub(height);
     let area = Rect::new(x, y, width, height);
     let _ = chat;
     frame.render_widget(Clear, area);
-    let list_items: Vec<ListItem> = items[start..end]
+    let list_items: Vec<ListItem> = rows[start..end]
         .iter()
         .enumerate()
-        .map(|(i, (name, desc))| {
+        .map(|(i, row)| {
             let style = if start + i == selected {
                 Style::default().fg(Color::Black).bg(app.theme.accent)
             } else {
                 Style::default().fg(Color::White)
             };
-            ListItem::new(Line::from(vec![
-                Span::styled(format!(" {:<10}", name), style),
-                Span::styled(format!(" {}", desc), Style::default().fg(app.theme.muted)),
-            ]))
+            let mut spans = Vec::new();
+            if let Some(ready) = row.dot {
+                let dot_color = if ready { app.theme.success } else { app.theme.muted };
+                spans.push(Span::styled(
+                    if ready { " ● " } else { " ○ " },
+                    Style::default().fg(dot_color),
+                ));
+            }
+            spans.push(Span::styled(format!(" {:<12}", row.left), style));
+            spans.push(Span::styled(
+                format!(" {}", truncate(&row.right, 44)),
+                Style::default().fg(app.theme.muted),
+            ));
+            ListItem::new(Line::from(spans))
         })
         .collect();
-    let title = if items.len() > visible {
-        format!(" {}/{} ", selected + 1, items.len())
+    let title = if title.is_empty() {
+        if rows.len() > visible {
+            format!(" {}/{} ", selected + 1, rows.len())
+        } else {
+            String::new()
+        }
     } else {
-        String::new()
+        format!(" {} {}/{} ", title, selected + 1, rows.len())
     };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(ratatui::widgets::BorderType::Rounded)
         .title(title)
-        .border_style(Style::default().fg(app.theme.muted));
-    frame.render_widget(List::new(list_items).block(block), area);
-}
-
-fn render_model_picker(frame: &mut Frame, chat: Rect, input: Rect, app: &App) {
-    let filter = crate::tui::input::model_filter(&app.input.buffer).unwrap_or("").to_string();
-    let items = crate::tui::input::model_entries(app, &filter);
-    if items.is_empty() {
-        return;
-    }
-    let visible = items.len().min(8);
-    let selected = app.model_idx % items.len();
-    let max_start = items.len().saturating_sub(visible);
-    let start = (selected.saturating_sub(visible.saturating_sub(1))).min(max_start);
-    let end = (start + visible).min(items.len());
-    let height = (visible + 2) as u16;
-    let width = input.width.min(64);
-    let x = input.x;
-    let y = input.y.saturating_sub(height);
-    let area = Rect::new(x, y, width, height);
-    let _ = chat;
-    frame.render_widget(Clear, area);
-    let list_items: Vec<ListItem> = items[start..end]
-        .iter()
-        .enumerate()
-        .map(|(i, (p, m, ready))| {
-            let style = if start + i == selected {
-                Style::default().fg(Color::Black).bg(app.theme.accent)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            let dot = if *ready { "●" } else { "○" };
-            let dot_color = if *ready { app.theme.success } else { app.theme.muted };
-            ListItem::new(Line::from(vec![
-                Span::styled(format!(" {} ", dot), Style::default().fg(dot_color)),
-                Span::styled(format!("{:<10}", p), style),
-                Span::styled(format!(" {}", truncate(&crate::tui::input::model_label(p, m), 34)), Style::default().fg(app.theme.muted)),
-            ]))
-        })
-        .collect();
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Rounded)
-        .title(format!(" model {}/{} — ● key ready ", selected + 1, items.len()))
-        .border_style(Style::default().fg(app.theme.muted));
-    frame.render_widget(List::new(list_items).block(block), area);
-}
-
-fn render_login_picker(frame: &mut Frame, chat: Rect, input: Rect, app: &App) {
-    let filter = app.input.buffer["/login ".len()..].to_string();
-    let items = crate::tui::input::provider_entries(app, &filter);
-    if items.is_empty() {
-        return;
-    }
-    let visible = items.len().min(8);
-    let selected = app.login_idx % items.len();
-    let max_start = items.len().saturating_sub(visible);
-    let start = (selected.saturating_sub(visible.saturating_sub(1))).min(max_start);
-    let end = (start + visible).min(items.len());
-    let height = (visible + 2) as u16;
-    let width = input.width.min(64);
-    let x = input.x;
-    let y = input.y.saturating_sub(height);
-    let area = Rect::new(x, y, width, height);
-    let _ = chat;
-    frame.render_widget(Clear, area);
-    let list_items: Vec<ListItem> = items[start..end]
-        .iter()
-        .enumerate()
-        .map(|(i, (pid, ready, base))| {
-            let style = if start + i == selected {
-                Style::default().fg(Color::Black).bg(app.theme.accent)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            let dot = if *ready { "●" } else { "○" };
-            let dot_color = if *ready { app.theme.success } else { app.theme.muted };
-            let endpoint = if base.is_empty() { "(default endpoint)".to_string() } else { truncate(base, 30) };
-            ListItem::new(Line::from(vec![
-                Span::styled(format!(" {} ", dot), Style::default().fg(dot_color)),
-                Span::styled(format!("{:<10}", pid), style),
-                Span::styled(format!(" {}", endpoint), Style::default().fg(app.theme.muted)),
-            ]))
-        })
-        .collect();
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Rounded)
-        .title(format!(" login {}/{} — ● key saved ", selected + 1, items.len()))
-        .border_style(Style::default().fg(app.theme.muted));
-    frame.render_widget(List::new(list_items).block(block), area);
-}
-
-fn render_choice_picker(frame: &mut Frame, chat: Rect, input: Rect, app: &App, mode: &crate::tui::input::ChoiceMode) {
-    let filter = crate::tui::input::choice_mode(&app.input.buffer).map(|(_, f)| f).unwrap_or_default();
-    let items = crate::tui::input::choice_entries(app, mode, &filter);
-    if items.is_empty() {
-        return;
-    }
-    let visible = items.len().min(8);
-    let selected = app.choice_idx % items.len();
-    let max_start = items.len().saturating_sub(visible);
-    let start = (selected.saturating_sub(visible.saturating_sub(1))).min(max_start);
-    let end = (start + visible).min(items.len());
-    let height = (visible + 2) as u16;
-    let width = input.width.min(64);
-    let x = input.x;
-    let y = input.y.saturating_sub(height);
-    let area = Rect::new(x, y, width, height);
-    let _ = chat;
-    frame.render_widget(Clear, area);
-    let list_items: Vec<ListItem> = items[start..end]
-        .iter()
-        .enumerate()
-        .map(|(i, (value, desc))| {
-            let style = if start + i == selected {
-                Style::default().fg(Color::Black).bg(app.theme.accent)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            ListItem::new(Line::from(vec![
-                Span::styled(format!(" {:<12}", value), style),
-                Span::styled(format!(" {}", truncate(desc, 44)), Style::default().fg(app.theme.muted)),
-            ]))
-        })
-        .collect();
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Rounded)
-        .title(format!("{} {}/{} ", crate::tui::input::choice_title(mode).trim(), selected + 1, items.len()))
         .border_style(Style::default().fg(app.theme.muted));
     frame.render_widget(List::new(list_items).block(block), area);
 }

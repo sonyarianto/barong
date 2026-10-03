@@ -275,19 +275,16 @@ pub fn choice_entries(app: &App, mode: &ChoiceMode, filter: &str) -> Vec<(String
 /// meaning "confirm highlight"). Consumes the navigation flag.
 /// Returns None when the typed text should flow through untouched.
 fn take_choice(app: &mut App, mode: &ChoiceMode, arg: &str) -> Option<String> {
-    if !app.choice_navigated && !arg.is_empty() {
+    if !app.picker_navigated && !arg.is_empty() {
         return None;
     }
     let items = choice_entries(app, mode, arg);
-    app.choice_navigated = false;
+    let idx = app.picker_idx;
+    reset_picker(app);
     if items.is_empty() {
-        app.choice_idx = 0;
         return None;
     }
-    let idx = app.choice_idx % items.len();
-    let v = items[idx].0.clone();
-    app.choice_idx = 0;
-    Some(v)
+    Some(items[idx % items.len()].0.clone())
 }
 
 /// One entry in the `/model` picker: (provider, model, key-ready).
@@ -332,7 +329,9 @@ pub fn model_entries(app: &App, filter: &str) -> Vec<(String, String, bool)> {
     }
     // Ready providers first, then alphabetical.
     out.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1)));
-    out.truncate(30);
+    // Cap the UNFILTERED view only: filtering above already ran on the full
+    // set, so typing still finds anything. Matches discovery's per-provider cap.
+    out.truncate(100);
     out
 }
 
@@ -481,17 +480,136 @@ pub fn command_palette(filter: &str) -> Vec<(&'static str, &'static str)> {
         .collect()
 }
 
-fn complete_palette(app: &mut App) {
-    let items = command_palette(&app.input.buffer);
-    if items.is_empty() {
-        return;
+/// One row in the unified picker: what Tab/Enter writes, what is shown.
+pub struct PickerRow {
+    pub complete: String,
+    pub left: String,
+    pub right: String,
+    pub dot: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PickerKind {
+    Commands,
+    Models,
+    Providers,
+    Choice(ChoiceMode),
+}
+
+/// Which picker (if any) the input buffer opens, plus its filter text.
+pub fn picker_kind(buffer: &str) -> Option<(PickerKind, String)> {
+    if let Some(f) = model_filter(buffer) {
+        return Some((PickerKind::Models, f.to_string()));
     }
-    let idx = app.palette_idx % items.len();
-    let (name, _) = items[idx];
-    app.input.buffer = format!("{} ", name);
+    if let Some(rest) = buffer.strip_prefix("/login ") {
+        return Some((PickerKind::Providers, rest.to_string()));
+    }
+    if let Some((m, f)) = choice_mode(buffer) {
+        return Some((PickerKind::Choice(m), f));
+    }
+    if buffer.starts_with('/') && !buffer.contains([' ', '\n']) {
+        return Some((PickerKind::Commands, buffer.to_string()));
+    }
+    None
+}
+
+pub fn picker_title(kind: &PickerKind) -> &'static str {
+    match kind {
+        PickerKind::Commands => "",
+        PickerKind::Models => "model",
+        PickerKind::Providers => "login",
+        PickerKind::Choice(m) => choice_title(m).trim(),
+    }
+}
+
+/// Rows for the unified picker. Same window math renders all kinds.
+pub fn picker_rows(app: &App, kind: &PickerKind, filter: &str) -> Vec<PickerRow> {
+    match kind {
+        PickerKind::Commands => command_palette(filter)
+            .into_iter()
+            .map(|(n, d)| PickerRow {
+                complete: format!("{} ", n),
+                left: format!("{:<10}", n),
+                right: d.to_string(),
+                dot: None,
+            })
+            .collect(),
+        PickerKind::Models => model_entries(app, filter)
+            .into_iter()
+            .map(|(p, m, ready)| PickerRow {
+                complete: format!("/model {} ", model_label(&p, &m)),
+                left: format!("{:<10}", p),
+                right: crate::tui::ui::truncate(&model_label(&p, &m), 34),
+                dot: Some(ready),
+            })
+            .collect(),
+        PickerKind::Providers => provider_entries(app, filter)
+            .into_iter()
+            .map(|(pid, ready, base)| PickerRow {
+                complete: format!("/login {} ", pid),
+                left: format!("{:<10}", pid),
+                right: if base.is_empty() {
+                    "(default endpoint)".into()
+                } else {
+                    crate::tui::ui::truncate(&base, 30)
+                },
+                dot: Some(ready),
+            })
+            .collect(),
+        PickerKind::Choice(m) => choice_entries(app, m, filter)
+            .into_iter()
+            .map(|(v, d)| PickerRow {
+                complete: format!("{}{} ", choice_prefix(m), v),
+                left: format!("{:<12}", v),
+                right: crate::tui::ui::truncate(&d, 44),
+                dot: None,
+            })
+            .collect(),
+    }
+}
+
+/// Arrow navigation inside whichever picker is open.
+/// Returns true when the key is consumed. The bare command palette with zero
+/// matches yields to input history; every other open picker swallows the key.
+fn handle_picker_nav(app: &mut App, dir: isize) -> bool {
+    let Some((kind, filter)) = picker_kind(&app.input.buffer).map(|(k, f)| (k, f)) else {
+        return false;
+    };
+    let rows = picker_rows(app, &kind, &filter);
+    if rows.is_empty() {
+        return !matches!(kind, PickerKind::Commands);
+    }
+    let n = rows.len();
+    app.picker_idx = if dir < 0 {
+        (app.picker_idx + n - 1) % n
+    } else {
+        (app.picker_idx + 1) % n
+    };
+    app.picker_navigated = true;
+    true
+}
+
+/// Tab completes the highlighted row of whichever picker is open.
+/// Returns true when consumed (picker was open).
+fn handle_picker_tab(app: &mut App) -> bool {
+    let Some((kind, filter)) = picker_kind(&app.input.buffer).map(|(k, f)| (k, f)) else {
+        return false;
+    };
+    let rows = picker_rows(app, &kind, &filter);
+    if rows.is_empty() {
+        return true;
+    }
+    let idx = app.picker_idx % rows.len();
+    app.input.buffer = rows[idx].complete.clone();
     app.input.cursor_pos = app.input.buffer.len();
-    app.palette_idx = 0;
-    app.palette_navigated = false;
+    app.picker_idx = 0;
+    app.picker_navigated = false;
+    true
+}
+
+fn reset_picker(app: &mut App) {
+    app.picker_idx = 0;
+    app.picker_navigated = false;
 }
 
 fn complete_mention(app: &mut App) {
@@ -782,14 +900,7 @@ pub fn handle_events(app: &mut App) -> Result<()> {
             KeyCode::Char(c) => {
                 app.input.buffer.insert(app.input.cursor_pos, c);
                 app.input.cursor_pos += 1;
-                app.palette_idx = 0;
-                app.palette_navigated = false;
-                app.model_idx = 0;
-                app.model_navigated = false;
-                app.login_idx = 0;
-                app.login_navigated = false;
-                app.choice_idx = 0;
-                app.choice_navigated = false;
+                reset_picker(app);
             }
             KeyCode::Backspace => {
                 if app.input.cursor_pos > 0 && !app.input.buffer.is_empty() {
@@ -803,14 +914,7 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                         app.input.cursor_pos = idx;
                     }
                 }
-                app.palette_idx = 0;
-                app.palette_navigated = false;
-                app.model_idx = 0;
-                app.model_navigated = false;
-                app.login_idx = 0;
-                app.login_navigated = false;
-                app.choice_idx = 0;
-                app.choice_navigated = false;
+                reset_picker(app);
             }
             KeyCode::Delete => {
                 if app.input.cursor_pos < app.input.buffer.len() {
@@ -828,109 +932,20 @@ pub fn handle_events(app: &mut App) -> Result<()> {
             KeyCode::Home => app.input.cursor_pos = 0,
             KeyCode::End => app.input.cursor_pos = app.input.buffer.len(),
             KeyCode::Up => {
-                if let Some(f) = model_filter(&app.input.buffer).map(|s| s.to_string()) {
-                    let items = model_entries(app, &f);
-                    if !items.is_empty() {
-                        app.model_idx = (app.model_idx + items.len() - 1) % items.len();
-                        app.model_navigated = true;
-                    }
+                if handle_picker_nav(app, -1) {
                     return Ok(());
-                }
-                if app.input.buffer.starts_with("/login ") {
-                    let filter = app.input.buffer["/login ".len()..].to_string();
-                    let items = provider_entries(app, &filter);
-                    if !items.is_empty() {
-                        app.login_idx = (app.login_idx + items.len() - 1) % items.len();
-                        app.login_navigated = true;
-                    }
-                    return Ok(());
-                }
-                if let Some((mode, f)) = choice_mode(&app.input.buffer) {
-                    let items = choice_entries(app, &mode, &f);
-                    if !items.is_empty() {
-                        app.choice_idx = (app.choice_idx + items.len() - 1) % items.len();
-                        app.choice_navigated = true;
-                    }
-                    return Ok(());
-                }
-                if app.input.buffer.starts_with('/') {
-                    let items = command_palette(&app.input.buffer);
-                    if !items.is_empty() {
-                        app.palette_idx = (app.palette_idx + items.len() - 1) % items.len();
-                        app.palette_navigated = true;
-                        return Ok(());
-                    }
                 }
                 app.input.navigate_history(-1);
             }
             KeyCode::Down => {
-                if let Some(f) = model_filter(&app.input.buffer).map(|s| s.to_string()) {
-                    let items = model_entries(app, &f);
-                    if !items.is_empty() {
-                        app.model_idx = (app.model_idx + 1) % items.len();
-                        app.model_navigated = true;
-                    }
+                if handle_picker_nav(app, 1) {
                     return Ok(());
-                }
-                if app.input.buffer.starts_with("/login ") {
-                    let filter = app.input.buffer["/login ".len()..].to_string();
-                    let items = provider_entries(app, &filter);
-                    if !items.is_empty() {
-                        app.login_idx = (app.login_idx + 1) % items.len();
-                        app.login_navigated = true;
-                    }
-                    return Ok(());
-                }
-                if let Some((mode, f)) = choice_mode(&app.input.buffer) {
-                    let items = choice_entries(app, &mode, &f);
-                    if !items.is_empty() {
-                        app.choice_idx = (app.choice_idx + 1) % items.len();
-                        app.choice_navigated = true;
-                    }
-                    return Ok(());
-                }
-                if app.input.buffer.starts_with('/') {
-                    let items = command_palette(&app.input.buffer);
-                    if !items.is_empty() {
-                        app.palette_idx = (app.palette_idx + 1) % items.len();
-                        app.palette_navigated = true;
-                        return Ok(());
-                    }
                 }
                 app.input.navigate_history(1);
             }
             KeyCode::Tab => {
-                if let Some(f) = model_filter(&app.input.buffer).map(|s| s.to_string()) {
-                    let items = model_entries(app, &f);
-                    if !items.is_empty() {
-                        let idx = app.model_idx % items.len();
-                        let (p, m, _) = &items[idx];
-                        app.input.buffer = format!("/model {} ", model_label(p, m));
-                        app.input.cursor_pos = app.input.buffer.len();
-                        app.model_idx = 0;
-                        app.model_navigated = false;
-                    }
-                } else if app.input.buffer.starts_with("/login ") {
-                    let filter = app.input.buffer["/login ".len()..].to_string();
-                    let items = provider_entries(app, &filter);
-                    if !items.is_empty() {
-                        let idx = app.login_idx % items.len();
-                        app.input.buffer = format!("/login {} ", items[idx].0);
-                        app.input.cursor_pos = app.input.buffer.len();
-                        app.login_idx = 0;
-                        app.login_navigated = false;
-                    }
-                } else if let Some((mode, f)) = choice_mode(&app.input.buffer) {
-                    let items = choice_entries(app, &mode, &f);
-                    if !items.is_empty() {
-                        let idx = app.choice_idx % items.len();
-                        app.input.buffer = format!("{}{} ", choice_prefix(&mode), items[idx].0);
-                        app.input.cursor_pos = app.input.buffer.len();
-                        app.choice_idx = 0;
-                        app.choice_navigated = false;
-                    }
-                } else if app.input.buffer.starts_with('/') {
-                    complete_palette(app);
+                if handle_picker_tab(app) {
+                    return Ok(());
                 } else if app.input.buffer.contains('@') {
                     complete_mention(app);
                 } else {
@@ -946,14 +961,13 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                     app.input.cursor_pos += 1;
                     return Ok(());
                 }
-                // Bare `/xxx`: exact command runs, highlight completes,
-                // bare `/login`/`/model` open their pickers.
-                match bare_enter(&app.input.buffer, app.palette_idx, app.palette_navigated) {
+                // Bare `/xxx`: exact command runs, highlight completes;
+                // bare picker commands open their picker.
+                match bare_enter(&app.input.buffer, app.picker_idx, app.picker_navigated) {
                     Some(BareEnter::Complete(text)) => {
                         app.input.buffer = text.clone();
                         app.input.cursor_pos = app.input.buffer.len();
-                        app.palette_idx = 0;
-                        app.palette_navigated = false;
+                        reset_picker(app);
                         if text == "/model " {
                             // Preselect the active model (highlight only).
                             let items = model_entries(app, "");
@@ -961,7 +975,7 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                                 .iter()
                                 .position(|(p, m, _)| p == &app.provider_name && m == &app.current_model)
                             {
-                                app.model_idx = pos;
+                                app.picker_idx = pos;
                             }
                         }
                         return Ok(());
@@ -971,8 +985,7 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                 let input = std::mem::take(&mut app.input.buffer);
                 app.input.cursor_pos = 0;
                 app.input.history_index = None;
-                app.palette_idx = 0;
-                app.palette_navigated = false;
+                reset_picker(app);
                 if input.trim().is_empty() || app.event_rx.is_some() {
                     return Ok(());
                 }
@@ -1007,10 +1020,7 @@ pub fn handle_events(app: &mut App) -> Result<()> {
                 } else if app.input.buffer.starts_with('/') {
                     app.input.buffer.clear();
                     app.input.cursor_pos = 0;
-                    app.palette_navigated = false;
-                    app.model_navigated = false;
-                    app.login_navigated = false;
-                    app.choice_navigated = false;
+                    reset_picker(app);
                 }
             }
             KeyCode::PageUp => {
@@ -1061,14 +1071,14 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
             return Ok(true);
         }
         "/model" => {
-            if arg.is_empty() || app.model_navigated {
+            if arg.is_empty() || app.picker_navigated {
                 // Picker was open: Enter confirms the highlighted entry.
                 // (On open it's preselected to the active model; arrows move it.)
                 let items = model_entries(app, arg);
                 if items.is_empty() {
                     app.conversation.add_message("assistant".into(), "No matching models.".into());
                 } else {
-                    let idx = app.model_idx % items.len();
+                    let idx = app.picker_idx % items.len();
                     let (p, m, ready) = items[idx].clone();
                     match app.apply_provider_model(&p, &m) {
                         Ok(_) => {
@@ -1078,8 +1088,7 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
                         Err(e) => app.conversation.add_message("assistant".into(), e),
                     }
                 }
-                app.model_navigated = false;
-                app.model_idx = 0;
+                reset_picker(app);
             } else if let Some(pid) = app
                 .config
                 .all_provider_ids()
@@ -1140,16 +1149,15 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
             return Ok(true);
         }
         "/login" => {
-            if app.login_navigated {
+            if app.picker_navigated {
                 // Enter after arrow-key navigation: use highlighted picker entry.
                 let items = provider_entries(app, arg);
                 if items.is_empty() {
                     app.notice = Some("no matching providers".into());
-                } else if let Some(sel) = items.get(app.login_idx % items.len()) {
+                } else if let Some(sel) = items.get(app.picker_idx % items.len()) {
                     begin_login(app, &sel.0.clone());
                 }
-                app.login_navigated = false;
-                app.login_idx = 0;
+                reset_picker(app);
             } else if arg.is_empty() {
                 // Picker is open with nothing typed: confirm the highlighted
                 // entry — first provider still missing a key, else the first.
@@ -1454,6 +1462,7 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
                 out.push_str(&format!("- `{}` — {}\n", n, d));
             }
             out.push_str("\n**Tips:** `@path` attaches files · `Ctrl+O` toggles tool output");
+            out.push_str("\n**Picker (same everywhere):** type to filter · `↑↓` move · `Tab` complete · `Enter` confirm · `Esc` back out");
             app.conversation.add_message("assistant".into(), out);
             app.save_session();
             app.is_home = false;
@@ -1763,8 +1772,8 @@ mod tests {
         let mut app = test_app();
         app.set_theme("light");
         assert_eq!(app.theme.name, "light");
-        app.choice_navigated = true;
-        app.choice_idx = 2; // dark, light, barong
+        app.picker_navigated = true;
+        app.picker_idx = 2; // dark, light, barong
         handle_slash(&mut app, "/theme ").unwrap();
         assert_eq!(app.theme.name, "barong");
     }
@@ -1782,8 +1791,8 @@ mod tests {
         app.provider_name = "openai".into();
         app.current_model = "gpt-4o".into();
         assert_eq!(app.provider_name, "openai");
-        app.choice_navigated = true;
-        app.choice_idx = 0; // most recent first
+        app.picker_navigated = true;
+        app.picker_idx = 0; // most recent first
         handle_slash(&mut app, "/resume ").unwrap();
         assert_eq!(app.session_id.as_deref(), Some(saved_id.as_str()));
         assert_eq!(app.provider_name, "nvidia");
@@ -1862,8 +1871,8 @@ mod tests {
     fn model_navigated_applies_highlight() {
         let mut app = test_app();
         app.auth.set("nvidia", "nvapi-test-key");
-        app.model_navigated = true;
-        app.model_idx = 0;
+        app.picker_navigated = true;
+        app.picker_idx = 0;
         handle_slash(&mut app, "/model nvid").unwrap();
         assert_eq!(app.provider_name, "nvidia", "highlighted entry must win");
     }
