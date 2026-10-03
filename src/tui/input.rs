@@ -1495,7 +1495,7 @@ fn handle_slash(app: &mut App, trimmed: &str) -> Result<bool> {
                     }
                 }
                 if let Some(t) = s.theme.clone() {
-                    app.set_theme(&t);
+                    app.adopt_theme(&t);
                 }
                 app.is_home = false;
                 app.streaming_text.clear();
@@ -2028,6 +2028,58 @@ mod tests {
         // Explicit acknowledgement still clears it.
         app.clear_notice();
         assert!(app.notice.is_none());
+    }
+
+    /// Resuming is state, not status. `/resume` already says so in the
+    /// transcript, so the status line must stay quiet — otherwise the banner
+    /// sits above the prompt looking like an instruction, and restoring the
+    /// session's theme used to leave "theme: light" there instead.
+    #[test]
+    fn resuming_says_it_in_the_transcript_and_not_on_the_status_line() {
+        use crate::session::SessionMeta;
+        let mut app = test_app();
+        let meta = SessionMeta {
+            provider: "openai".into(),
+            model: "gpt-4o".into(),
+            theme: "light".into(),
+        };
+        let sid = app.session_manager.save(&app.conversation.messages, &meta);
+        app.clear_notice();
+
+        app.input.buffer = format!("/resume {sid}");
+        crate::tui::input::handle_enter(&mut app, false).unwrap();
+        app.adopt_theme("dark"); // undo the restore so the assert below is real
+
+        let rows = draw_cells(&mut app, 84, 24);
+        // A blocking "no API key" is a fair thing for the status line to say
+        // here; anything about the resume or the theme is not.
+        if let Some(line) = notice_line(&rows, 24) {
+            assert!(
+                !line.contains("esumed") && !line.contains("theme"),
+                "resume must not talk about itself on the status line: {:?}",
+                line
+            );
+        }
+        // And the id it prints has to be the real one, not a truncated one.
+        let convo = chat_rows(&rows, 24).join("\n");
+        assert!(
+            convo.contains(&format!("Resumed `{sid}`")),
+            "full id in the transcript: {:?}",
+            convo
+        );
+    }
+
+    /// A theme the user did not ask about must not appear as a notice, while
+    /// the one they did ask for still confirms itself.
+    #[test]
+    fn adopting_a_theme_quietly_leaves_the_notice_alone() {
+        let mut app = test_app();
+        app.clear_notice();
+        app.adopt_theme("light");
+        assert!(app.notice.is_none(), "adopting is not an event worth reporting");
+
+        app.set_theme("dark");
+        assert_eq!(app.notice.as_ref().map(|n| n.text.as_str()), Some("theme: dark"));
     }
 
     #[test]

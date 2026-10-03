@@ -157,14 +157,13 @@ impl App {
             .and_then(|s| s.theme.clone())
             .map(|t| theme::resolve(&t))
             .unwrap_or_else(|| theme::resolve(&config.resolve_theme()));
-        let (conversation, session_id, restored_id) = match restored {
+        let (conversation, session_id) = match restored {
             Some(s) => {
                 let mut c = Conversation::new();
                 c.messages = s.messages;
-                let id = s.id.clone();
-                (c, Some(id.clone()), Some(id))
+                (c, Some(s.id))
             }
-            None => (Conversation::new(), None, None),
+            None => (Conversation::new(), None),
         };
         // NOTE: `restored` was moved by the match above; theme came from `restored_theme`.
 
@@ -218,6 +217,11 @@ impl App {
             picker_idx: 0,
             picker_navigated: false,
             tool_expanded: false,
+            // Only a blocking complaint earns this row. There is deliberately
+            // no "resumed session" banner: the restored transcript is its own
+            // evidence, `/resume` with no argument lists the ids, and a line
+            // above the prompt about a past session reads as an instruction
+            // rather than as status.
             notice: if initial_key.is_empty() {
                 Some(Notice {
                     text: format!(
@@ -226,13 +230,6 @@ impl App {
                     ),
                     level: NoticeLevel::Blocking,
                     cause: NoticeCause::MissingKey,
-                })
-            } else if let Some(id) = restored_id {
-                let short: String = id.chars().take(12).collect();
-                Some(Notice {
-                    text: format!("resumed session {} — /new for fresh", short),
-                    level: NoticeLevel::Info,
-                    cause: NoticeCause::Generic,
                 })
             } else {
                 None
@@ -425,9 +422,18 @@ impl App {
         }
     }
 
-    pub fn set_theme(&mut self, name: &str) {
+    /// Adopt a theme without saying anything. Used when barong restores state
+    /// on its own — `/resume` reapplying the session's saved theme is an
+    /// implementation detail, and reporting it left "theme: light" sitting on
+    /// the status line after a resume, which read as if it were the point.
+    pub fn adopt_theme(&mut self, name: &str) {
         self.theme = theme::resolve(name);
         self.config.theme = Some(self.theme.name.clone());
+    }
+
+    /// `/theme` — the user asked, so confirm it.
+    pub fn set_theme(&mut self, name: &str) {
+        self.adopt_theme(name);
         self.notify(format!("theme: {}", self.theme.name));
     }
 
